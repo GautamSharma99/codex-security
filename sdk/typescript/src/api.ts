@@ -397,6 +397,14 @@ export class CodexSecurity {
       ) {
         await this.#refreshPersistentRuntime(runtime, scanEnvironment, signal);
       }
+      const effectiveConfig =
+        runtime.effectiveConfig ?? (await mergedCodexConfig(this.config));
+      if (runtime.configPath !== undefined) {
+        await writeCodexConfig(
+          runtime.configPath,
+          scanPreflightCodexConfig(effectiveConfig, repo),
+        );
+      }
       const runtimeHome = await realpath(runtime.codexHome);
       requireOutputOutsideRepository(protectedRoot, runtimeHome, "runtime");
       if (
@@ -533,8 +541,6 @@ export class CodexSecurity {
         mode,
         pluginVersion: runtime.plugin.version,
       };
-      const effectiveConfig =
-        runtime.effectiveConfig ?? (await mergedCodexConfig(this.config));
       const { model } = scanModelConfiguration(effectiveConfig);
       validateScanCostLimit(options.maxCostUsd, model);
       const tracker = new ScanCostTracker({
@@ -1578,7 +1584,7 @@ function scanRecipe(
     mode,
     ...(repositoryRevision === null ? {} : { repositoryRevision }),
     pluginVersion,
-    config: scanPreflightCodexConfig(effectiveConfig),
+    config: scanPreflightCodexConfig(effectiveConfig, repository),
     ...(failOnSeverity === undefined ? {} : { failOnSeverity }),
     ...(knowledgeBasePaths === undefined ? {} : { knowledgeBasePaths }),
     ...(maxCostUsd === undefined ? {} : { maxCostUsd }),
@@ -1833,7 +1839,10 @@ export function scanRuntimeCodexConfig(
   };
 }
 
-export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
+export function scanPreflightCodexConfig(
+  config: JsonObject,
+  activeProjectPath?: string,
+): JsonObject {
   const safeString = (value: unknown, maxLength: number): value is string =>
     typeof value === "string" &&
     value.length > 0 &&
@@ -1903,18 +1912,41 @@ export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
     }
     return result;
   };
+  const prioritizedEntries = (
+    value: Record<string, unknown>,
+    priority: string | undefined,
+  ): [string, unknown][] => {
+    const entries = Object.entries(value);
+    if (priority === undefined || !Object.hasOwn(value, priority)) {
+      return entries;
+    }
+    return [
+      [priority, value[priority]],
+      ...entries.filter(([key]) => key !== priority),
+    ];
+  };
 
   const result = executionConfig(config);
-  if (safeProfileName(config["profile"])) {
-    result["profile"] = config["profile"];
+  const selectedProfile = safeProfileName(config["profile"])
+    ? config["profile"]
+    : undefined;
+  if (selectedProfile !== undefined) {
+    result["profile"] = selectedProfile;
   }
   const profiles = config["profiles"];
   if (isRecord(profiles)) {
     const sanitized: JsonObject = {};
-    for (const [name, profile] of Object.entries(profiles).slice(0, 256)) {
+    let accepted = 0;
+    for (const [name, profile] of prioritizedEntries(
+      profiles,
+      selectedProfile,
+    )) {
       if (!safeProfileName(name) || !isRecord(profile)) continue;
       const projected = executionConfig(profile as JsonObject);
-      if (Object.keys(projected).length > 0) sanitized[name] = projected;
+      if (Object.keys(projected).length === 0) continue;
+      sanitized[name] = projected;
+      accepted += 1;
+      if (accepted === 256) break;
     }
     if (Object.keys(sanitized).length > 0) result["profiles"] = sanitized;
   }
@@ -1927,13 +1959,19 @@ export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
   const projects = config["projects"];
   if (isRecord(projects)) {
     const sanitized: JsonObject = {};
-    for (const [path, project] of Object.entries(projects).slice(0, 256)) {
+    let accepted = 0;
+    for (const [path, project] of prioritizedEntries(
+      projects,
+      activeProjectPath,
+    )) {
       if (!safeString(path, 4096) || !isAbsolute(path) || !isRecord(project)) {
         continue;
       }
       const trust = project["trust_level"];
       if (trust !== "trusted" && trust !== "untrusted") continue;
       sanitized[path] = { trust_level: trust };
+      accepted += 1;
+      if (accepted === 256) break;
     }
     if (Object.keys(sanitized).length > 0) result["projects"] = sanitized;
   }
