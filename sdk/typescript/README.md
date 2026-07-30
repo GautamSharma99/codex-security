@@ -405,6 +405,11 @@ service,https://github.com/acme/service.git,0123456789abcdef0123456789abcdef0123
 `--workers` limits concurrent scans and `--max-attempts` retries failures.
 Results remain under `--output-dir`; rerun the same command to resume.
 
+Bulk-scan inventories are limited to 8 MiB and 1,000 repositories. Interactive
+GitHub discovery applies the same repository limit and stops before creating an
+inventory if the selected account exceeds it. Split larger campaigns into
+separate repository lists and output directories.
+
 ### Scan history and reruns
 
 `npx @openai/codex-security scans list` lists scans for the current repository. Pass a
