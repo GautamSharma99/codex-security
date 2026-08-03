@@ -86,6 +86,7 @@ from workbench_scan_start import (
     safe_segment,
     scan_diff_identity,
     scan_target_identity,
+    stored_diff_target,
 )
 from workbench_schema import MIGRATIONS, normalize_pre_release_migrations, sql_statements
 from workbench_source_excerpt import finding_source_excerpt
@@ -502,19 +503,6 @@ def expected_target_kinds(scan: sqlite3.Row) -> list[str]:
     if scan["target_snapshot_digest"] == clean_worktree_content_digest():
         return ["git_revision"]
     return ["git_worktree"]
-
-
-def stored_diff_target(row: sqlite3.Row) -> dict[str, str] | None:
-    if not row["diff_target_kind"]:
-        return None
-    target = {
-        "baseRevision": row["diff_base_revision"],
-        "headRevision": row["diff_head_revision"],
-        "kind": row["diff_target_kind"],
-    }
-    if row["diff_content_digest"]:
-        target["contentDigest"] = row["diff_content_digest"]
-    return target
 
 
 def requested_scan_paths(scan: sqlite3.Row) -> list[str]:
@@ -1374,11 +1362,15 @@ def pin_legacy_manifest_digest(
         raise
 
 
-def complete_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+def complete_scan(
+    connection: sqlite3.Connection, args: argparse.Namespace, *, prepare_only: bool = False
+) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
-    cost_json = parse_scan_cost(args.cost_json)
+    cost_json = None if prepare_only else parse_scan_cost(args.cost_json)
     with scan_completion_lock(scan_id):
-        return complete_scan_locked(connection, scan_id, args.claim_token, cost_json)
+        return complete_scan_locked(
+            connection, scan_id, args.claim_token, cost_json, prepare_only=prepare_only
+        )
 
 
 def complete_scan_locked(
@@ -1386,6 +1378,8 @@ def complete_scan_locked(
     scan_id: str,
     claim_token: str | None,
     cost_json: str | None,
+    *,
+    prepare_only: bool = False,
 ) -> dict[str, Any]:
     scan = require_scan(connection, scan_id)
     if scan["status"] == "complete":
@@ -1412,15 +1406,36 @@ def complete_scan_locked(
     )
     if scan["recipe_json"] is None:
         deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
-    warnings = []
+    warnings = json.loads(scan["completion_warnings_json"])
     warning = scan_target_warning(scan)
-    if warning is not None:
+    if warning is not None and warning not in warnings:
         warnings.append(warning)
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
     completion_timestamp = now()
     completion_binding = workbench_completion_binding(scan, completion_timestamp)
     if scan["recipe_json"] is not None:
-        manifest = read_json_object(artifact_path(scan_dir, ARTIFACTS["manifest"], required=True))
+        draft_artifacts: dict[str, Path] = {}
+        missing_drafts = []
+        for file_name in (
+            ARTIFACTS["manifest"],
+            ARTIFACTS["findings"],
+            ARTIFACTS["coverage"],
+        ):
+            try:
+                (scan_dir / file_name).lstat()
+            except FileNotFoundError:
+                missing_drafts.append(file_name)
+                continue
+            draft_path = artifact_path(scan_dir, file_name, required=True)
+            if draft_path is not None:
+                draft_artifacts[file_name] = draft_path
+        if missing_drafts:
+            raise SystemExit(
+                "Scan agent did not create required draft artifacts: "
+                f"{', '.join(missing_drafts)}. Check that the scan agent can run shell "
+                "commands and write to the scan directory before retrying."
+            )
+        manifest = read_json_object(draft_artifacts[ARTIFACTS["manifest"]])
         manifest_scan = manifest.get("scan")
         if isinstance(manifest_scan, dict) and manifest_scan.get("sealedAt") is not None:
             completion_binding["startedAt"] = manifest_scan.get("startedAt")
@@ -1443,9 +1458,23 @@ def complete_scan_locked(
         for kind, filename in ARTIFACTS.items()
     }
     manifest_digest = published_manifest_digest(scan_dir, manifest)
+    if prepare_only:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = connection.execute(
+                "UPDATE scans SET completion_warnings_json = ? WHERE id = ? AND status = 'running'",
+                (json.dumps(warnings), scan["id"]),
+            )
+            if updated.rowcount != 1:
+                raise SystemExit("Only a running scan can be prepared for completion.")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return scan_context(connection, scan["id"])
     connection.execute("BEGIN IMMEDIATE")
     try:
-        timestamp = completion_timestamp
+        timestamp = manifest["scan"]["completedAt"]
         scan = require_scan(connection, scan["id"])
         if scan["status"] == "complete":
             connection.commit()
@@ -1609,7 +1638,14 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     except BaseException:
         connection.rollback()
         raise
-    return {"scanDir": str(scan_dir), "scanId": scan_id, "targetId": target_id}
+    scan = require_scan(connection, scan_id)
+    return {
+        "contract": scan_contract(scan),
+        "scanDir": str(scan_dir),
+        "scanId": scan_id,
+        "targetId": target_id,
+        "targetRevision": scan["target_revision"],
+    }
 
 
 def parse_scan_recipe(value: str, repository: Path) -> dict[str, Any]:
@@ -3454,6 +3490,38 @@ def require_canonical_scan_directory(scan_dir: Path) -> Path:
         scan_dir
     ):
         raise SystemExit("Scan directory must be an existing canonical non-symlink directory.")
+    # Re-check privacy on every resolution so a mid-scan rename/replace under a
+    # shared parent cannot substitute another user's forged artifact tree.
+    if os.name != "nt":
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SystemExit(
+                "Scan directory must not be accessible to other users (chmod 700)."
+            )
+        geteuid = getattr(os, "geteuid", None)
+        effective_uid = geteuid() if geteuid is not None else None
+        if effective_uid is not None and metadata.st_uid != effective_uid:
+            raise SystemExit("Scan directory must be owned by the current user.")
+        for parent in scan_dir.parents:
+            try:
+                parent_metadata = parent.lstat()
+            except OSError as exc:
+                raise SystemExit("Scan output parent could not be inspected.") from exc
+            if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_ISLNK(
+                parent_metadata.st_mode
+            ):
+                raise SystemExit("Scan output parent must be a non-symlink directory.")
+            if effective_uid is not None and parent_metadata.st_uid not in {
+                0,
+                effective_uid,
+            }:
+                raise SystemExit("Scan output parent must have a trusted owner.")
+            if (
+                stat.S_IMODE(parent_metadata.st_mode) & 0o022
+                and not parent_metadata.st_mode & stat.S_ISVTX
+            ):
+                raise SystemExit(
+                    "Scan output parent must not be group- or world-writable without the sticky bit."
+                )
     return scan_dir
 
 
@@ -3596,8 +3664,10 @@ def main() -> None:
                 require_scan=require_scan,
                 scan_context=scan_context,
             )
-        elif args.command == "complete-scan":
-            result = complete_scan(connection, args)
+        elif args.command in {"prepare-scan-completion", "complete-scan"}:
+            result = complete_scan(
+                connection, args, prepare_only=args.command == "prepare-scan-completion"
+            )
         elif args.command == "cancel-scan":
             result = cancel_scan(connection, args)
         elif args.command == "fail-scan":

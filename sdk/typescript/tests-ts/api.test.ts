@@ -40,8 +40,12 @@ import {
   scanRuntimeCodexConfig,
 } from "../src/api.js";
 import { writeCodexConfig, type JsonObject } from "../src/config.js";
-import { runWorkbench } from "../src/runtime.js";
+import {
+  runWorkbench,
+  setCodexSecurityCredentialLogout,
+} from "../src/runtime.js";
 import { normalizeTarget } from "../src/targets.js";
+import { REDACTED_CREDENTIALS, SYNTHETIC_CREDENTIALS } from "./cli-fixtures.js";
 import { INTEGRATION_TARGET, PLUGIN_ROOT } from "./plugin-root.js";
 
 type ScanObserverName = Parameters<
@@ -51,10 +55,39 @@ type ScanObserverName = Parameters<
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const EXAMPLE = join(PLUGIN_ROOT, "examples", "completed-scan");
 const temporaryDirectories: string[] = [];
+const TEST_SNAPSHOT_DIGEST = `codex-security-snapshot/v1:sha256:${"a".repeat(64)}`;
 const TestClientBase = CodexSecurity as unknown as new (
   config: Record<string, unknown>,
   dependencies: Record<string, unknown>,
 ) => CodexSecurity;
+
+function mockScanRegistration(args: readonly string[]) {
+  const recipe = JSON.parse(args[args.indexOf("--recipe-json") + 1]!) as {
+    repositoryRevision?: string;
+    target: { kind: string };
+  };
+  const kind =
+    recipe.target.kind === "refs" || recipe.target.kind === "working_tree"
+      ? "git_diff"
+      : recipe.repositoryRevision === undefined
+        ? "directory_snapshot"
+        : "git_revision";
+
+  return {
+    scanId: "scan_example_001",
+    targetId: "target_sha256_example",
+    targetRevision: recipe.repositoryRevision ?? "unversioned",
+    scanDir: args[args.indexOf("--scan-dir") + 1],
+    contract: {
+      target: {
+        allowedKinds: [kind],
+        ...(kind === "directory_snapshot"
+          ? { requiredSnapshotDigest: TEST_SNAPSHOT_DIGEST }
+          : {}),
+      },
+    },
+  };
+}
 
 class TestClient extends TestClientBase {
   public constructor(
@@ -64,11 +97,7 @@ class TestClient extends TestClientBase {
     super(config, {
       runWorkbench: async (_options: unknown, args: readonly string[]) => {
         if (args[0] === "register-cli-scan") {
-          return {
-            scanId: "scan_example_001",
-            targetId: "target_sha256_example",
-            scanDir: args[args.indexOf("--scan-dir") + 1],
-          };
+          return mockScanRegistration(args);
         }
         if (args[0] === "get-scan-feedback") {
           return {
@@ -240,6 +269,25 @@ describe("CodexSecurity orchestration", () => {
       sandbox_mode: "workspace-write",
       allow_login_shell: true,
       default_permissions: "unsafe",
+    });
+  });
+
+  test("keeps persistent credentials read-only within writable scan state", () => {
+    const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    const config = scanRuntimeCodexConfig({}, stateDirectory, credentialHome);
+
+    expect(config).toMatchObject({
+      permissions: {
+        codex_security_scan: {
+          filesystem: {
+            ":root": "read",
+            ":workspace_roots": "write",
+            [stateDirectory]: "write",
+            [credentialHome]: "read",
+          },
+        },
+      },
     });
   });
 
@@ -448,6 +496,93 @@ describe("CodexSecurity orchestration", () => {
     ).resolves.toBeUndefined();
   });
 
+  test("prioritizes the selected profile and active project before projection limits", () => {
+    const activeProject = "/workspace/active";
+    const profiles = Object.fromEntries([
+      ...Array.from({ length: 256 }, (_, index) => [
+        `profile_${index}`,
+        { features: { goals: index % 2 === 0 } },
+      ]),
+      ["selected", { agents: { max_threads: 17 } }],
+    ]);
+    const projects = Object.fromEntries([
+      ...Array.from({ length: 256 }, (_, index) => [
+        `/workspace/project-${index}`,
+        { trust_level: "untrusted" },
+      ]),
+      [activeProject, { trust_level: "trusted" }],
+    ]);
+
+    const prioritized = scanPreflightCodexConfig(
+      {
+        profile: "selected",
+        profiles,
+        projects,
+      },
+      join(activeProject, "packages", "service"),
+    );
+
+    expect(prioritized["profile"]).toBe("selected");
+    expect(Object.keys(prioritized["profiles"] as JsonObject)).toHaveLength(
+      256,
+    );
+    expect(prioritized["profiles"]).toMatchObject({
+      selected: { agents: { max_threads: 17 } },
+    });
+    expect(Object.keys(prioritized["projects"] as JsonObject)).toHaveLength(
+      256,
+    );
+    expect(prioritized["projects"]).toMatchObject({
+      [activeProject]: { trust_level: "trusted" },
+    });
+
+    const validProfiles = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        `valid_${index}`,
+        { features: { goals: true } },
+      ]),
+    );
+    const validProjects = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        `/valid/project-${index}`,
+        { trust_level: "trusted" },
+      ]),
+    );
+    const afterInvalid = scanPreflightCodexConfig({
+      profiles: {
+        ...Object.fromEntries(
+          Array.from({ length: 256 }, (_, index) => [
+            `invalid.profile.${index}`,
+            { features: { goals: false } },
+          ]),
+        ),
+        ...validProfiles,
+      },
+      projects: {
+        ...Object.fromEntries(
+          Array.from({ length: 256 }, (_, index) => [
+            `relative-${index}`,
+            { trust_level: "trusted" },
+          ]),
+        ),
+        ...validProjects,
+      },
+    });
+
+    expect(Object.keys(afterInvalid["profiles"] as JsonObject)).toHaveLength(
+      256,
+    );
+    expect(afterInvalid["profiles"]).toMatchObject({
+      valid_255: { features: { goals: true } },
+    });
+    expect(Object.keys(afterInvalid["projects"] as JsonObject)).toHaveLength(
+      256,
+    );
+    expect(afterInvalid["projects"]).toMatchObject({
+      "/valid/project-255": { trust_level: "trusted" },
+    });
+  });
+
   test("selects a real-scan target in the active repository layout", async () => {
     await expect(
       stat(join(REPOSITORY_ROOT, INTEGRATION_TARGET)),
@@ -591,6 +726,55 @@ describe("CodexSecurity orchestration", () => {
     ).rejects.toThrow("cost limit is not available for the configured model");
     expect(runtimeStarted).toBe(false);
     await unpriced.close();
+    await client.close();
+  });
+
+  test("validates deep scan settings before initializing the runtime", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    let runtimeStarted = false;
+    const client = new TestClient(
+      {},
+      {
+        environment: {},
+        prepareRuntime: async () => {
+          runtimeStarted = true;
+          throw new Error("runtime should not initialize");
+        },
+      },
+    );
+
+    await expect(
+      client.preflight(repository, {
+        mode: "deep",
+        workers: 2,
+        subagents: 0,
+        stopAfterNoNew: 3,
+        maxDiscoveryRuns: 10,
+      }),
+    ).resolves.toMatchObject({
+      mode: "deep",
+      workers: 2,
+      subagents: 0,
+      stopAfterNoNew: 3,
+      maxDiscoveryRuns: 10,
+    });
+    await expect(client.preflight(repository, { workers: 1 })).rejects.toThrow(
+      "Deep scan settings require deep mode",
+    );
+    for (const invalid of [
+      { workers: 0 },
+      { workers: 1.5 },
+      { subagents: -1 },
+      { stopAfterNoNew: 0 },
+      { maxDiscoveryRuns: Number.POSITIVE_INFINITY },
+    ]) {
+      await expect(
+        client.preflight(repository, { mode: "deep", ...invalid }),
+      ).rejects.toThrow("integer");
+    }
+    expect(runtimeStarted).toBe(false);
     await client.close();
   });
 
@@ -942,11 +1126,7 @@ describe("CodexSecurity orchestration", () => {
           }
           if (args[0] !== "register-cli-scan") return {};
           registration = args;
-          return {
-            scanId: "scan_example_001",
-            targetId: "target_sha256_example",
-            scanDir: output,
-          };
+          return mockScanRegistration(args);
         },
         createCodex: () => ({
           startThread: () => ({
@@ -984,6 +1164,59 @@ describe("CodexSecurity orchestration", () => {
       "previous scan\n",
     );
     await expect(stat(output)).resolves.toBeDefined();
+    await client.close();
+  });
+
+  test("reports the real scan failure when scan cleanup also fails", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    await mkdir(join(repository, "src"), { recursive: true });
+    await mkdir(codexHome);
+    let failedCleanupPath: string | undefined;
+    const warnings: string[] = [];
+    const client = new TestClient(
+      {},
+      {
+        environment: { OPENAI_API_KEY: "test-key" },
+        prepareRuntime: async () => preparedRuntime(codexHome),
+        resolvePluginPython: async () => "/managed/python",
+        repositoryRevision: async () => "deadbeef",
+        createCodex: (options: CodexOptions) => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              // Cleanup removes the target paths file with a non-recursive rm, so
+              // replacing that file with a directory makes cleanup reject on every
+              // platform.
+              failedCleanupPath =
+                options.env?.["CODEX_SECURITY_TARGET_PATHS_FILE"];
+              await rm(failedCleanupPath!, { force: true });
+              await mkdir(failedCleanupPath!);
+              throw new Error("the model refused the scan");
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(
+      client.run(repository, {
+        target: ["src"],
+        outputDir: join(root, "scan"),
+        onWarning: (warning) => {
+          warnings.push(warning);
+        },
+      }),
+    ).rejects.toThrow("the model refused the scan");
+    expect(failedCleanupPath).toBeDefined();
+    // The cleanup failure is reported rather than discarded.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(
+      warnings.filter((warning) =>
+        warning.startsWith("Could not clean up after the Codex Security scan:"),
+      ),
+    ).toHaveLength(1);
     await client.close();
   });
 
@@ -1308,11 +1541,7 @@ describe("CodexSecurity orchestration", () => {
         runWorkbench: async (_options: unknown, args: readonly string[]) => {
           commands.push(args);
           if (args[0] === "register-cli-scan") {
-            return {
-              scanId: "scan_example_001",
-              targetId: "target_sha256_example",
-              scanDir,
-            };
+            return mockScanRegistration(args);
           }
           if (args[0] === "get-scan-feedback") {
             return {
@@ -1382,7 +1611,12 @@ describe("CodexSecurity orchestration", () => {
       CODEX_SECURITY_SCAN_DIR: scanDir,
       CODEX_SECURITY_PLUGIN_ROOT: PLUGIN_ROOT,
       CODEX_SECURITY_TARGET_DISPLAY_NAME: basename(repository),
+      CODEX_SECURITY_TARGET_KIND: "git_revision",
+      CODEX_SECURITY_TARGET_REVISION: "deadbeef",
     });
+    expect((codexOptions as CodexOptions | null)?.env).not.toHaveProperty(
+      "CODEX_SECURITY_TARGET_SNAPSHOT_DIGEST",
+    );
     expect((codexOptions as CodexOptions | null)?.config).toMatchObject({
       default_permissions: "codex_security_scan",
       allow_login_shell: false,
@@ -1403,6 +1637,9 @@ describe("CodexSecurity orchestration", () => {
     expect(prompt).toContain('Repository root: "$CODEX_SECURITY_REPOSITORY"');
     expect(prompt).toContain('Use "$PYTHON" as <python_command>');
     expect(prompt).toContain("$CODEX_SECURITY_TARGET_DISPLAY_NAME");
+    expect(prompt).toContain("$CODEX_SECURITY_TARGET_KIND");
+    expect(prompt).toContain("$CODEX_SECURITY_TARGET_REVISION");
+    expect(prompt).toContain("$CODEX_SECURITY_TARGET_SNAPSHOT_DIGEST");
     expect(prompt).toContain("codex-security-plugin");
     expect(prompt).not.toContain("CODEX_SECURITY_KNOWLEDGE_BASE");
     expect(prompt).not.toContain("false_positive_feedback.json");
@@ -1432,9 +1669,251 @@ describe("CodexSecurity orchestration", () => {
       "scan_example_001",
     ]);
     expect(commands[2]).toEqual([
+      "prepare-scan-completion",
+      "--scan-id",
+      "scan_example_001",
+    ]);
+    expect(commands[3]).toEqual([
       "complete-scan",
       "--scan-id",
       "scan_example_001",
+    ]);
+    await client.close();
+  });
+
+  test("passes the workbench snapshot contract to dirty Git scans", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    let codexOptions: CodexOptions | null = null;
+
+    const client = new TestClient(
+      {},
+      {
+        environment: {},
+        prepareRuntime: async () => preparedRuntime(codexHome),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          if (args[0] === "register-cli-scan") {
+            return {
+              ...mockScanRegistration(args),
+              targetRevision: "cafebabe",
+              contract: {
+                target: {
+                  allowedKinds: ["git_worktree"],
+                  requiredSnapshotDigest: TEST_SNAPSHOT_DIGEST,
+                },
+              },
+            };
+          }
+          if (args[0] === "get-scan-feedback") {
+            return {
+              scanId: "scan_example_001",
+              targetId: "target_sha256_example",
+              falsePositives: [],
+            };
+          }
+          return {};
+        },
+        createCodex: (options: CodexOptions) => {
+          codexOptions = options;
+          return {
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                throw new Error("target contract captured");
+              },
+            }),
+          };
+        },
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toThrow(
+      "target contract captured",
+    );
+    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
+      CODEX_SECURITY_TARGET_KIND: "git_worktree",
+      CODEX_SECURITY_TARGET_REVISION: "cafebabe",
+      CODEX_SECURITY_TARGET_SNAPSHOT_DIGEST: TEST_SNAPSHOT_DIGEST,
+    });
+    await client.close();
+  });
+
+  test("applies deep scan overrides over the user's existing settings", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-home");
+    const codexHome = join(root, "runtime-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(join(ambientHome, "codex-security"), { recursive: true });
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(
+      join(ambientHome, "codex-security", "config.toml"),
+      [
+        "[deep_scan]",
+        "workers = 5",
+        "subagents = 2",
+        "stop_after_no_new = 7",
+        "max_discovery_runs = 60",
+        "[other]",
+        "enabled = true",
+        "",
+      ].join("\n"),
+    );
+    let recipe: Record<string, unknown> | undefined;
+    const client = new TestClient(
+      {},
+      {
+        environment: { CODEX_HOME: ambientHome },
+        prepareRuntime: async () => preparedRuntime(codexHome),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          if (args[0] !== "register-cli-scan") {
+            return {
+              scanId: "scan_example_001",
+              targetId: "target_sha256_example",
+              falsePositives: [],
+            };
+          }
+          recipe = JSON.parse(args[args.indexOf("--recipe-json") + 1]!);
+          return mockScanRegistration(args);
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              throw new Error("deep scan settings captured");
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(
+      client.run(repository, {
+        mode: "deep",
+        workers: 2,
+        subagents: 0,
+        maxDiscoveryRuns: 10,
+      }),
+    ).rejects.toThrow("deep scan settings captured");
+    const configuration = await readFile(
+      join(codexHome, "codex-security", "config.toml"),
+      "utf8",
+    );
+    expect(configuration).toContain("workers = 2");
+    expect(configuration).toContain("subagents = 0");
+    expect(configuration).toContain("stop_after_no_new = 7");
+    expect(configuration).toContain("max_discovery_runs = 10");
+    expect(configuration).toContain("[other]");
+    expect(configuration).toContain("enabled = true");
+    expect(recipe).toMatchObject({
+      mode: "deep",
+      deepScan: { workers: 2, subagents: 0, maxDiscoveryRuns: 10 },
+    });
+    await client.close();
+  });
+
+  test("rejects a scan registration without an authoritative target contract", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+
+    const client = new TestClient(
+      {},
+      {
+        environment: {},
+        prepareRuntime: async () => preparedRuntime(codexHome),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) =>
+          args[0] === "register-cli-scan"
+            ? {
+                ...mockScanRegistration(args),
+                contract: { target: { allowedKinds: [] } },
+              }
+            : {},
+        createCodex: () => {
+          throw new Error("Codex must not start");
+        },
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toThrow(
+      "invalid scan registration",
+    );
+    await client.close();
+  });
+
+  test("fails a prepared scan before publishing rejected scan artifacts", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const commands: string[] = [];
+
+    const client = new TestClient(
+      {},
+      {
+        environment: {},
+        prepareRuntime: async () => preparedRuntime(codexHome),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          commands.push(args[0]!);
+          if (args[0] === "register-cli-scan") {
+            return mockScanRegistration(args);
+          }
+          if (args[0] === "get-scan-feedback") {
+            return {
+              scanId: "scan_example_001",
+              targetId: "target_sha256_example",
+              falsePositives: [],
+            };
+          }
+          if (args[0] === "prepare-scan-completion") {
+            await writeFile(join(scanDir, "findings.json"), "corrupted\n");
+          }
+          return {};
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              await copyCompletedScan(root);
+              return { events: completedEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toThrow();
+    expect(commands).toEqual([
+      "register-cli-scan",
+      "get-scan-feedback",
+      "prepare-scan-completion",
+      "fail-scan",
     ]);
     await client.close();
   });
@@ -1478,11 +1957,7 @@ describe("CodexSecurity orchestration", () => {
         runWorkbench: async (_options: unknown, args: readonly string[]) => {
           commands.push(args);
           if (args[0] === "register-cli-scan") {
-            return {
-              scanId: "scan_example_001",
-              targetId: "target_sha256_example",
-              scanDir,
-            };
+            return mockScanRegistration(args);
           }
           if (args[0] === "get-scan-feedback") {
             return {
@@ -1562,7 +2037,7 @@ describe("CodexSecurity orchestration", () => {
           repositoryRevision: async () => "deadbeef",
           runWorkbench: async (_options: unknown, args: readonly string[]) => {
             if (args[0] === "register-cli-scan") {
-              return { scanId, targetId, scanDir };
+              return mockScanRegistration(args);
             }
             return args[0] === "get-scan-feedback" ? feedback : {};
           },
@@ -1608,11 +2083,7 @@ describe("CodexSecurity orchestration", () => {
         runWorkbench: async (_options: unknown, args: readonly string[]) => {
           commands.push(args);
           if (args[0] === "register-cli-scan") {
-            return {
-              scanId: "scan_example_001",
-              targetId: "target_sha256_example",
-              scanDir,
-            };
+            return mockScanRegistration(args);
           }
           if (args[0] === "get-scan-feedback") {
             return {
@@ -1726,11 +2197,7 @@ describe("CodexSecurity orchestration", () => {
         runWorkbench: async (_options: unknown, args: readonly string[]) => {
           commands.push(args);
           if (args[0] === "register-cli-scan") {
-            return {
-              scanId: "scan_example_001",
-              targetId: "target_sha256_example",
-              scanDir,
-            };
+            return mockScanRegistration(args);
           }
           if (args[0] === "get-scan-feedback") {
             return {
@@ -1771,6 +2238,7 @@ describe("CodexSecurity orchestration", () => {
     expect(commands.map(([command]) => command)).toEqual([
       "register-cli-scan",
       "get-scan-feedback",
+      "prepare-scan-completion",
       "complete-scan",
     ]);
     expect(commands.some((args) => args[0] === "fail-scan")).toBe(false);
@@ -1811,11 +2279,7 @@ describe("CodexSecurity orchestration", () => {
           }
           if (args[0] !== "register-cli-scan") return {};
           recipe = JSON.parse(args[args.indexOf("--recipe-json") + 1]!);
-          return {
-            scanId: "scan_example_001",
-            targetId: "target_sha256_example",
-            scanDir,
-          };
+          return mockScanRegistration(args);
         },
         createCodex: (options: CodexOptions) => ({
           startThread: () => ({
@@ -1969,6 +2433,87 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
+  test("redacts credentials from the stored scan failure message", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const stateDirectory = join(root, "state");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const environment = {
+      PATH: process.env["PATH"],
+      CODEX_SECURITY_STATE_DIR: stateDirectory,
+    };
+    const commands: Array<readonly string[]> = [];
+    const quotedCredential = JSON.stringify({
+      client_secret_value: "SYNTHETIC correct horse battery staple",
+    });
+    const redactedFailure = `${REDACTED_CREDENTIALS} {"client_secret_value":"[redacted]"}`;
+    const client = new TestClient(
+      {},
+      {
+        environment,
+        prepareRuntime: async () => ({
+          ...preparedRuntime(codexHome),
+          environment,
+        }),
+        resolvePluginPython: async () => python!,
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (
+          options: Parameters<typeof runWorkbench>[0],
+          args: readonly string[],
+        ) => {
+          commands.push(args);
+          return await runWorkbench(options, args);
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              async function* failingEvents(): AsyncGenerator<ThreadEvent> {
+                yield {
+                  type: "error",
+                  message: `${SYNTHETIC_CREDENTIALS} ${quotedCredential}`,
+                };
+              }
+              return { events: failingEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    // The in-memory error keeps its original text; only what leaves the process
+    // is redacted, so the CLI can still classify the upstream failure.
+    await expect(client.run(repository)).rejects.toThrow(SYNTHETIC_CREDENTIALS);
+    const failure = commands.find((args) => args[0] === "fail-scan");
+    const scanId = failure?.[2] ?? "";
+    expect(scanId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(failure?.[3]).toBe("--message");
+    expect(failure?.[4]).toBe(redactedFailure);
+
+    // `scans show` reads the stored message back through get-scan.
+    const context = await runWorkbench(
+      { python: python!, pluginRoot: PLUGIN_ROOT, environment },
+      ["get-scan", "--scan-id", scanId],
+    );
+    expect(context["scan"]).toMatchObject({
+      progress: { status: "failed" },
+      failureMessage: redactedFailure,
+    });
+
+    // Every synthetic credential is tagged SYNTHETIC, so the database file
+    // itself proves nothing was persisted anywhere on the failure path.
+    const database = await readFile(join(stateDirectory, "workbench.sqlite3"));
+    expect(database.toString("latin1")).not.toContain("SYNTHETIC");
+    await client.close();
+  });
+
   test("retains default scan output under persistent plugin state", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
@@ -2059,7 +2604,7 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
-  test("creates a private readable preflight snapshot outside the credential home for a real runtime", async () => {
+  test("keeps a private preflight snapshot isolated from persistent credentials", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const ambientHome = join(root, "ambient-codex-home");
@@ -2073,11 +2618,21 @@ describe("CodexSecurity orchestration", () => {
     expect(interpreter).not.toBeNull();
     let capturedConfigPath: string | undefined;
     let capturedCodexHome: string | undefined;
+    const unrelatedProjects = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        join(root, `unrelated-project-${index}`),
+        { trust_level: "untrusted" },
+      ]),
+    );
     const client = new TestClient(
       {
         pluginPath: PLUGIN_ROOT,
         codexOverrides: {
           features: { goals: true },
+          projects: {
+            ...unrelatedProjects,
+            [repository]: { trust_level: "trusted" },
+          },
           mcp_servers: {
             private: {
               command: "echo",
@@ -2117,6 +2672,13 @@ describe("CodexSecurity orchestration", () => {
                       ":workspace_roots": "write",
                       [join(ambientHome, "state", "plugins", "codex-security")]:
                         "write",
+                      [join(
+                        ambientHome,
+                        "state",
+                        "plugins",
+                        "codex-security",
+                        "codex-home",
+                      )]: "read",
                     },
                   },
                 },
@@ -2129,6 +2691,11 @@ describe("CodexSecurity orchestration", () => {
               expect(serialized).not.toContain("RUNTIME_SHELL_SECRET");
               expect(serialized).not.toContain("mcp_servers");
               expect(serialized).not.toContain("shell_environment_policy");
+              expect(parseToml(serialized)).toMatchObject({
+                projects: {
+                  [repository]: { trust_level: "trusted" },
+                },
+              });
               expect(input).toContain('--config "$CODEX_SECURITY_CONFIG_PATH"');
               expect(input).toContain("--effective-config");
               const shellEnvironment = options.env as Record<string, string>;
@@ -2197,7 +2764,143 @@ describe("CodexSecurity orchestration", () => {
       await client.close();
     }
     expect(existsSync(capturedConfigPath!)).toBe(false);
-    expect(existsSync(capturedCodexHome!)).toBe(false);
+    expect(capturedCodexHome).toBe(
+      join(ambientHome, "state", "plugins", "codex-security", "codex-home"),
+    );
+    expect(existsSync(capturedCodexHome!)).toBe(true);
+  });
+
+  test("reuses keyring-compatible credentials across separate scan clients", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    const stateDirectory = join(root, "state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    const runtimeHomes: string[] = [];
+    await mkdir(repository);
+    await mkdir(ambientHome);
+    await writeFile(join(ambientHome, "auth.json"), "{}\n");
+
+    for (const index of [0, 1]) {
+      const scanDir = join(root, `scan-${index}`);
+      await mkdir(scanDir, { mode: 0o700 });
+      const client = new TestClient(
+        { pluginPath: PLUGIN_ROOT },
+        {
+          environment: {
+            CODEX_HOME: ambientHome,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+          resolvePluginPython: async () => "/managed/python",
+          prepareOutputDir: async () => scanDir,
+          repositoryRevision: async () => "deadbeef",
+          createCodex: (options: CodexOptions) => {
+            runtimeHomes.push(options.env?.["CODEX_HOME"] ?? "");
+            throw new Error("persistent credential scan reached");
+          },
+        },
+      );
+
+      try {
+        await expect(client.run(repository)).rejects.toThrow(
+          "persistent credential scan reached",
+        );
+      } finally {
+        await client.close();
+      }
+      expect(existsSync(credentialHome)).toBe(true);
+    }
+
+    expect(runtimeHomes).toEqual([credentialHome, credentialHome]);
+  });
+
+  test("serializes parallel scans sharing a managed credential home", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    const stateDirectory = join(root, "state");
+    const credentialHome = join(stateDirectory, "codex-home");
+    await mkdir(repository);
+    await mkdir(ambientHome);
+    await writeFile(join(ambientHome, "auth.json"), "{}\n");
+    let activeScans = 0;
+    let maximumActiveScans = 0;
+
+    const clients = await Promise.all(
+      [0, 1].map(async (index) => {
+        const scanDir = join(root, `parallel-scan-${index}`);
+        await mkdir(scanDir, { mode: 0o700 });
+        return new TestClient(
+          {
+            pluginPath: PLUGIN_ROOT,
+            codexOverrides: {
+              model: index === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra",
+            },
+          },
+          {
+            environment: {
+              CODEX_HOME: ambientHome,
+              CODEX_SECURITY_STATE_DIR: stateDirectory,
+            },
+            resolvePluginPython: async () => "/managed/python",
+            prepareOutputDir: async () => scanDir,
+            repositoryRevision: async () => "deadbeef",
+            createCodex: (options: CodexOptions) => {
+              expect(options.env?.["CODEX_HOME"]).toBe(credentialHome);
+              return {
+                startThread: () => ({
+                  id: null,
+                  async runStreamed() {
+                    activeScans += 1;
+                    maximumActiveScans = Math.max(
+                      maximumActiveScans,
+                      activeScans,
+                    );
+                    try {
+                      const expectedModel =
+                        index === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra";
+                      const before = parseToml(
+                        await readFile(
+                          join(credentialHome, "config.toml"),
+                          "utf8",
+                        ),
+                      );
+                      expect(before["model"]).toBe(expectedModel);
+                      await new Promise((resolve) => setTimeout(resolve, 40));
+                      const after = parseToml(
+                        await readFile(
+                          join(credentialHome, "config.toml"),
+                          "utf8",
+                        ),
+                      );
+                      expect(after["model"]).toBe(expectedModel);
+                      throw new Error("parallel managed scan reached");
+                    } finally {
+                      activeScans -= 1;
+                    }
+                  },
+                }),
+              };
+            },
+          },
+        );
+      }),
+    );
+
+    try {
+      await Promise.all(
+        clients.map(
+          async (client) =>
+            await expect(client.run(repository)).rejects.toThrow(
+              "parallel managed scan reached",
+            ),
+        ),
+      );
+      expect(existsSync(credentialHome)).toBe(true);
+      expect(maximumActiveScans).toBe(1);
+    } finally {
+      await Promise.all(clients.map(async (client) => await client.close()));
+    }
   });
 
   test("rejects a shell-visible plugin root inside CODEX_HOME", async () => {
@@ -2632,6 +3335,9 @@ describe("CodexSecurity orchestration", () => {
       "prompt captured",
     );
     expect(prompt).toContain("$codex-security:deep-security-scan");
+    expect(prompt).toContain(
+      'start_codex_security_deep_scan with { scanId: "$CODEX_SECURITY_SCAN_ID" }',
+    );
     expect(prompt).not.toContain(
       "This exhaustive scan authorizes the delegated-worker phases",
     );
@@ -2679,11 +3385,12 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
-  test("persists an ambient API key without filtering Codex-owned credentials", async () => {
+  test("passes environment API keys transiently without native login or keyring persistence", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const codexHome = join(root, "codex-home");
     const fakeCodex = join(root, "codex.mjs");
+    const nativeLoginMarker = join(root, "native-api-key-login");
     const scanDir = join(root, "scan");
     await mkdir(repository);
     await mkdir(codexHome);
@@ -2691,13 +3398,9 @@ describe("CodexSecurity orchestration", () => {
     await writeFile(
       fakeCodex,
       `
-if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
-  process.exitCode = 2;
-} else {
-  let apiKey = "";
-  for await (const chunk of process.stdin) apiKey += chunk;
-  if (apiKey.trim() !== "ambient-key") process.exitCode = 3;
-}
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(nativeLoginMarker)}, "native login was invoked");
+process.exitCode = 2;
 `,
     );
     let codexOptions: CodexOptions | null = null;
@@ -2768,14 +3471,17 @@ if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
       source: "OPENAI_API_KEY",
       verified: false,
     });
-    expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
+    expect((codexOptions as CodexOptions | null)?.apiKey).toBe("ambient-key");
     expect(
       (codexOptions as CodexOptions | null)?.codexPathOverride,
     ).toBeUndefined();
-    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-      OpenAi_Api_Key: "forwarded-openai-key",
-      codex_api_key: "forwarded-codex-key",
-    });
+    expect(
+      Object.keys((codexOptions as CodexOptions | null)?.env ?? {}).some(
+        (name) =>
+          ["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()),
+      ),
+    ).toBe(false);
+    expect(existsSync(nativeLoginMarker)).toBe(false);
     expect(pythonEnvironment).toMatchObject({
       openai_api_key: "stale-key",
       OPENAI_API_KEY: "ambient-key",
@@ -2783,6 +3489,125 @@ if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
     });
     expect(pythonProtectedRoot).toBe(await realpath(repository));
     await client.close();
+  });
+
+  test("accepts native keyring authentication without an auth.json file", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "managed-codex-home");
+    const scanDir = join(root, "scan");
+    const fakeCodex = join(root, "managed-codex.mjs");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(
+      fakeCodex,
+      `
+if (process.argv.slice(2).join(" ") !== "login status") {
+  process.exitCode = 2;
+} else if (process.env.CODEX_HOME !== ${JSON.stringify(codexHome)}) {
+  process.exitCode = 3;
+} else {
+  console.log("Logged in using ChatGPT");
+}
+`,
+    );
+
+    const client = new TestClient(
+      {},
+      {
+        environment: { CODEX_SECURITY_STATE_DIR: join(root, "state") },
+        prepareRuntime: async () => ({
+          ...preparedRuntime(codexHome),
+          environment: { CODEX_HOME: codexHome },
+          credentialsAvailable: false,
+        }),
+        resolveCodexCommand: () => ({
+          command: process.execPath,
+          prefixArgs: [fakeCodex],
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: () => {
+          throw new Error("managed keyring scan reached");
+        },
+      },
+    );
+
+    try {
+      await expect(client.run(repository, { auth: "chatgpt" })).rejects.toThrow(
+        "managed keyring scan reached",
+      );
+      expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("recreates isolated and managed runtimes when scan authentication changes", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-codex-home");
+    const stateDirectory = join(root, "state");
+    const dedicatedHome = join(stateDirectory, "codex-home");
+    const scanDir = join(root, "scan");
+    const ambientAuthentication = '{"auth_mode":"chatgpt"}\n';
+    await mkdir(repository);
+    await mkdir(ambientHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(ambientHome, "auth.json"), ambientAuthentication);
+    const runs: Array<{ home: string; apiKey?: string }> = [];
+    const client = new TestClient(
+      { pluginPath: PLUGIN_ROOT },
+      {
+        environment: {
+          CODEX_HOME: ambientHome,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+          OPENAI_API_KEY: "synthetic-transient-key",
+        },
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: (options: CodexOptions) => {
+          runs.push({
+            home: options.env?.["CODEX_HOME"] ?? "",
+            ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+          });
+          throw new Error("authentication-selected scan reached");
+        },
+      },
+    );
+
+    try {
+      await expect(client.run(repository, { auth: "api-key" })).rejects.toThrow(
+        "authentication-selected scan reached",
+      );
+      const firstIsolatedHome = runs[0]?.home;
+      expect(firstIsolatedHome).toBeDefined();
+      expect(firstIsolatedHome).not.toBe(dedicatedHome);
+      expect(runs[0]?.apiKey).toBe("synthetic-transient-key");
+
+      await expect(client.run(repository, { auth: "chatgpt" })).rejects.toThrow(
+        "authentication-selected scan reached",
+      );
+      expect(runs[1]).toEqual({ home: dedicatedHome });
+      expect(await readFile(join(dedicatedHome, "auth.json"), "utf8")).toBe(
+        ambientAuthentication,
+      );
+      expect(existsSync(firstIsolatedHome!)).toBe(false);
+
+      await expect(client.run(repository, { auth: "api-key" })).rejects.toThrow(
+        "authentication-selected scan reached",
+      );
+      expect(runs[2]?.home).not.toBe(dedicatedHome);
+      expect(runs[2]?.apiKey).toBe("synthetic-transient-key");
+      expect(await readFile(join(dedicatedHome, "auth.json"), "utf8")).toBe(
+        ambientAuthentication,
+      );
+    } finally {
+      await client.close();
+    }
   });
 
   test("does not cache an environment key as reusable file authentication", async () => {
@@ -2800,11 +3625,69 @@ if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
     ).resolves.toBe(false);
     expect(imported).toBe(false);
 
+    const isolatedHome = join(await temporaryDirectory(), "isolated-home");
+    await mkdir(isolatedHome, { mode: 0o700 });
     await expect(
       initialCredentialsAvailable(
         { OPENAI_API_KEY: "   " },
         "/ambient-home",
-        "/isolated-home",
+        isolatedHome,
+        async () => true,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  test("preserves an explicit stored sign-in instead of reimporting ambient authentication", async () => {
+    const root = await temporaryDirectory();
+    const ambientHome = join(root, "ambient-home");
+    const credentialHome = join(root, "credential-home");
+    await mkdir(ambientHome);
+    await mkdir(credentialHome, { mode: 0o700 });
+    await writeFile(join(ambientHome, "auth.json"), '{"token":"ambient"}\n');
+    await writeFile(
+      join(credentialHome, "auth.json"),
+      '{"token":"explicit"}\n',
+      { mode: 0o600 },
+    );
+    let imported = false;
+
+    await expect(
+      initialCredentialsAvailable({}, ambientHome, credentialHome, async () => {
+        imported = true;
+        return true;
+      }),
+    ).resolves.toBe(true);
+
+    expect(imported).toBe(false);
+    expect(await readFile(join(credentialHome, "auth.json"), "utf8")).toBe(
+      '{"token":"explicit"}\n',
+    );
+  });
+
+  test("does not reimport ambient credentials after an explicit logout", async () => {
+    const root = await temporaryDirectory();
+    const ambientHome = join(root, "ambient-home");
+    const credentialHome = join(root, "credential-home");
+    await mkdir(ambientHome);
+    await mkdir(credentialHome, { mode: 0o700 });
+    await writeFile(join(ambientHome, "auth.json"), '{"token":"ambient"}\n');
+    await setCodexSecurityCredentialLogout(credentialHome, true);
+    let imported = false;
+
+    await expect(
+      initialCredentialsAvailable({}, ambientHome, credentialHome, async () => {
+        imported = true;
+        return true;
+      }),
+    ).resolves.toBe(false);
+    expect(imported).toBe(false);
+
+    await setCodexSecurityCredentialLogout(credentialHome, false);
+    await expect(
+      initialCredentialsAvailable(
+        {},
+        ambientHome,
+        credentialHome,
         async () => true,
       ),
     ).resolves.toBe(true);
@@ -2816,26 +3699,14 @@ if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
     const ambientHome = join(root, "ambient-home");
     const codexHome = join(root, "codex-home");
     const scanDir = join(root, "scan");
-    const fakeCodex = join(root, "codex.mjs");
     const ambientAuthentication = '{"auth_mode":"chatgpt"}\n';
     await mkdir(repository);
     await mkdir(ambientHome);
-    await mkdir(codexHome);
+    await mkdir(codexHome, { mode: 0o700 });
     await mkdir(scanDir, { mode: 0o700 });
     await writeFile(join(ambientHome, "auth.json"), ambientAuthentication);
-    await writeFile(
-      fakeCodex,
-      `
-import { writeFileSync } from "node:fs";
-let apiKey = "";
-for await (const chunk of process.stdin) apiKey += chunk;
-writeFileSync(${JSON.stringify(join(codexHome, "auth.json"))}, JSON.stringify({
-  auth_mode: "api-key",
-  configured: apiKey.trim().length > 0,
-}));
-`,
-    );
     const authentications: ScanAuthentication[] = [];
+    const selectedApiKeys: Array<string | undefined> = [];
     const codexEnvironments: Array<Record<string, string> | undefined> = [];
     const client = new TestClient(
       {},
@@ -2848,14 +3719,11 @@ writeFileSync(${JSON.stringify(join(codexHome, "auth.json"))}, JSON.stringify({
           ...preparedRuntime(codexHome),
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
         resolvePluginPython: async () => "/managed/python",
         prepareOutputDir: async () => scanDir,
         repositoryRevision: async () => "deadbeef",
         createCodex: (options: CodexOptions) => {
+          selectedApiKeys.push(options.apiKey);
           codexEnvironments.push(options.env);
           throw new Error("scan reached");
         },
@@ -2869,12 +3737,8 @@ writeFileSync(${JSON.stringify(join(codexHome, "auth.json"))}, JSON.stringify({
         },
       }),
     ).rejects.toThrow("scan reached");
-    expect(
-      JSON.parse(await readFile(join(codexHome, "auth.json"), "utf8")),
-    ).toEqual({
-      auth_mode: "api-key",
-      configured: true,
-    });
+    expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
+    expect(selectedApiKeys).toEqual(["synthetic-openai-key"]);
 
     await expect(
       client.run(repository, {
@@ -2891,6 +3755,7 @@ writeFileSync(${JSON.stringify(join(codexHome, "auth.json"))}, JSON.stringify({
       { method: "api_key", source: "OPENAI_API_KEY", verified: false },
       { method: "stored_credentials", verified: false },
     ]);
+    expect(selectedApiKeys).toEqual(["synthetic-openai-key", undefined]);
     expect(
       Object.keys(codexEnvironments.at(-1) ?? {}).some((name) =>
         ["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()),
@@ -2903,24 +3768,14 @@ writeFileSync(${JSON.stringify(join(codexHome, "auth.json"))}, JSON.stringify({
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const codexHome = join(root, "codex-home");
-    const fakeCodex = join(root, "codex.mjs");
-    const keyLog = join(root, "keys.txt");
     const scanDir = join(root, "scan");
     await mkdir(repository);
     await mkdir(codexHome);
     await mkdir(scanDir, { mode: 0o700 });
-    await writeFile(
-      fakeCodex,
-      `
-import { appendFileSync } from "node:fs";
-let apiKey = "";
-for await (const chunk of process.stdin) apiKey += chunk;
-appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
-`,
-    );
     const environment: Record<string, string | undefined> = {
       OPENAI_API_KEY: "first-key",
     };
+    const selectedKeys: Array<string | undefined> = [];
     const client = new TestClient(
       {},
       {
@@ -2929,14 +3784,11 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
           ...preparedRuntime(codexHome),
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
         resolvePluginPython: async () => "/managed/python",
         prepareOutputDir: async () => scanDir,
         repositoryRevision: async () => "deadbeef",
-        createCodex: () => {
+        createCodex: (options: CodexOptions) => {
+          selectedKeys.push(options.apiKey);
           throw new Error("scan reached");
         },
       },
@@ -2946,7 +3798,7 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     environment["OPENAI_API_KEY"] = "second-key";
     await expect(client.run(repository)).rejects.toThrow("scan reached");
 
-    expect(await readFile(keyLog, "utf8")).toBe("first-key\nsecond-key\n");
+    expect(selectedKeys).toEqual(["first-key", "second-key"]);
     await client.close();
   });
 
@@ -3322,9 +4174,10 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
         return await originalRm(...args);
       },
     }));
+    const stateDirectory = join(root, "state");
     const client = new TestClient(
       { pluginPath: join(root, "missing-plugin") },
-      { environment: {} },
+      { environment: { CODEX_SECURITY_STATE_DIR: stateDirectory } },
     );
 
     try {
@@ -3347,7 +4200,8 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
           }),
         ]),
       );
-      expect(attempted).toHaveLength(2);
+      expect(attempted).toHaveLength(1);
+      expect(existsSync(join(stateDirectory, "codex-home"))).toBe(true);
     } finally {
       mock.module("node:fs/promises", () => ({
         ...fsPromises,
@@ -3363,14 +4217,14 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     }
   });
 
-  test("cancels interactive login children during close", async () => {
+  test("forces interactive login children to settle during close", async () => {
     const root = await temporaryDirectory();
     const codexHome = join(root, "codex-home");
     const fakeCodex = join(root, "codex.mjs");
     await mkdir(codexHome);
     await writeFile(
       fakeCodex,
-      'console.error("Open https://auth.example.test/device");\nconsole.error("User code: ABCD-EFGH");\nsetInterval(() => {}, 1000);\n',
+      'console.error("Open https://auth.example.test/device");\nconsole.error("User code: ABCD-EFGH");\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n',
     );
     const client = new TestClient(
       {},
@@ -3401,7 +4255,19 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     const login = await client.loginChatGPTDeviceCode();
     expect(login.verificationUrl).toBe("https://auth.example.test/device");
     expect(login.userCode).toBe("ABCD-EFGH");
-    await client.close();
+    const timeout = AbortSignal.timeout(5_000);
+    await expect(
+      Promise.race([
+        client.close(),
+        new Promise<never>((_, reject) => {
+          timeout.addEventListener(
+            "abort",
+            () => reject(new Error("SDK close did not settle login cleanup.")),
+            { once: true },
+          );
+        }),
+      ]),
+    ).resolves.toBeUndefined();
     await expect(login.wait()).resolves.toMatchObject({ success: false });
   });
 
@@ -3418,7 +4284,7 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     await writeFile(
       fakeCodex,
       `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeSync } from "node:fs";
 
 const args = process.argv.slice(2).join(" ");
 if (args === "login --with-api-key") {
@@ -3430,7 +4296,8 @@ if (args === "login --with-api-key") {
     appendFileSync(${JSON.stringify(keyLog)}, apiKey);
   }
 } else if (args === "login") {
-  console.error("Open https://auth.example.test/login");
+  writeSync(2, "Open https://auth.example.test/login\\n");
+  process.exit(0);
 } else {
   process.exitCode = 2;
 }
@@ -3485,12 +4352,14 @@ if (args === "login --with-api-key") {
       const login = await client.loginChatGPT();
       await expect(login.wait()).resolves.toMatchObject({ success: true });
       await client.run(repository);
-      expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
-      expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-        OPENAI_API_KEY: "ambient-key",
-        CODEX_API_KEY: "secondary-ambient-key",
-      });
-      expect(await readFile(keyLog, "utf8")).toBe("secret-key\nambient-key\n");
+      expect((codexOptions as CodexOptions | null)?.apiKey).toBe("ambient-key");
+      expect(
+        Object.keys((codexOptions as CodexOptions | null)?.env ?? {}).some(
+          (name) =>
+            ["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()),
+        ),
+      ).toBe(false);
+      expect(await readFile(keyLog, "utf8")).toBe("secret-key\n");
     } finally {
       await client.close();
     }

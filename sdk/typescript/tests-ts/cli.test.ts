@@ -21,11 +21,15 @@ import type {
   JsonObject,
   ScanPreflight,
 } from "../src/index.js";
+import { redactedErrorMessage } from "../src/errors.js";
 import {
   BUNDLED_PLUGIN_VERSION,
   CodexSecurityError,
   DiffTarget,
+  InvalidTargetError,
+  OutputDirectoryError,
   OutputInsideProtectedRootError,
+  PluginPythonUnavailableError,
   ScanCostLimitExceededError,
   ScanInterruptedError,
   VERSION,
@@ -104,6 +108,10 @@ describe("CLI", () => {
         properties: {
           path: { type: "array" },
           mode: { enum: ["standard", "deep"] },
+          workers: { type: "integer" },
+          subagents: { type: "integer" },
+          stopAfterNoNew: { type: "integer" },
+          maxDiscoveryRuns: { type: "integer" },
           model: { type: "string" },
           effort: { enum: ["minimal", "low", "medium", "high", "xhigh"] },
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
@@ -184,6 +192,182 @@ describe("CLI", () => {
       ),
     ).toBe(0);
     expect(completions.text()).toContain('export COMPLETE="bash"');
+  });
+
+  test("documents every public command argument and option", async () => {
+    const commands = [
+      ["scan"],
+      ["bulk-scan"],
+      ["export"],
+      ["validate"],
+      ["patch"],
+      ["login"],
+      ["logout"],
+      ["info"],
+      ["install-hook"],
+      ["scans", "list"],
+      ["scans", "show"],
+      ["scans", "rerun"],
+      ["scans", "match"],
+      ["scans", "compare"],
+      ["findings", "false-positive"],
+    ] as const;
+
+    for (const command of commands) {
+      const help = capture();
+      const schema = capture();
+      expect(
+        await main(
+          [...command, "--help"],
+          help.stream,
+          capture().stream,
+          dependencies(),
+        ),
+      ).toBe(0);
+      expect(help.text()).not.toMatch(/--[a-z][a-z0-9-]*[A-Z][A-Za-z0-9-]*/u);
+      expect(
+        await main(
+          [...command, "--schema", "--format", "json"],
+          schema.stream,
+          capture().stream,
+          dependencies(),
+        ),
+      ).toBe(0);
+
+      const definitions = JSON.parse(schema.text()) as {
+        args?: {
+          properties?: Record<string, { description?: string }>;
+        };
+        options?: {
+          properties?: Record<string, { description?: string }>;
+        };
+      };
+
+      for (const argument of Object.values(
+        definitions.args?.properties ?? {},
+      )) {
+        expect(typeof argument.description).toBe("string");
+        expect(argument.description?.trim().length).toBeGreaterThan(0);
+      }
+
+      for (const [name, option] of Object.entries(
+        definitions.options?.properties ?? {},
+      )) {
+        const flag = `--${name.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`;
+        expect(help.text()).toContain(flag);
+        expect(typeof option.description).toBe("string");
+        expect(option.description?.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("documents user-facing environment and deep-scan configuration", async () => {
+    const readme = await readFile(new URL("../README.md", import.meta.url), {
+      encoding: "utf8",
+    });
+
+    for (const setting of [
+      "OPENAI_API_KEY",
+      "CODEX_API_KEY",
+      "CODEX_SECURITY_STATE_DIR",
+      "CODEX_HOME",
+      "PYTHON",
+      "GH_HOST",
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "CODEX_SECURITY_GIT_HOST",
+      "CODEX_SECURITY_IMAGE",
+      "CODEX_SECURITY_USER",
+      "CODEX_SECURITY_SECCOMP",
+      "CODEX_SECURITY_CSV",
+      "CODEX_SECURITY_RESULTS",
+      "CODEX_SECURITY_STATE",
+      "CODEX_SECURITY_NO_UPDATE_NOTICE",
+      "NO_UPDATE_NOTIFIER",
+      "CODEX_SECURITY_NPM_REGISTRY",
+      "npm_config_registry",
+      "NPM_CONFIG_REGISTRY",
+      "NO_COLOR",
+      "TERM",
+      "CI",
+      "features.multi_agent_v2.max_concurrent_threads_per_session",
+      "agents.max_threads",
+      "$CODEX_HOME/codex-security/config.toml",
+      "[deep_scan]",
+      "stop_after_no_new",
+      "max_discovery_runs",
+    ]) {
+      expect(readme).toContain(setting);
+    }
+  });
+
+  test("keeps documented runtime and deep-scan defaults accurate", async () => {
+    const readme = await readFile(new URL("../README.md", import.meta.url), {
+      encoding: "utf8",
+    });
+    expect(readme).toContain(
+      `model = "${DEFAULT_SCAN_MODEL_CONFIGURATION.model}"`,
+    );
+    expect(readme).toContain(
+      `model_reasoning_effort = "${DEFAULT_SCAN_MODEL_CONFIGURATION.reasoningEffort}"`,
+    );
+
+    const features = DEFAULT_CODEX_CONFIG["features"] as JsonObject;
+    const multiAgent = features["multi_agent_v2"] as JsonObject;
+    expect(readme).toContain(
+      `max_concurrent_threads_per_session = ${String(multiAgent["max_concurrent_threads_per_session"])}`,
+    );
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const root = await mkdtemp(join(tmpdir(), "codex-security-deep-defaults-"));
+
+    try {
+      const result = spawnSync(
+        python!,
+        [
+          fileURLToPath(
+            new URL(
+              "../_bundled_plugin/scripts/deep_scan_config.py",
+              import.meta.url,
+            ),
+          ),
+          "--available-parallelism",
+          "12",
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_HOME: join(root, "codex-home"),
+            PYTHONDONTWRITEBYTECODE: "1",
+          },
+          timeout: 30_000,
+        },
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+
+      const defaults = JSON.parse(result.stdout) as {
+        workers: number;
+        subagents: number;
+        stopAfterNoNew: number;
+        maxDiscoveryRuns: number;
+      };
+      expect(defaults.workers).toBe(6);
+      expect(readme).toContain('workers = "auto"');
+      expect(readme).toContain(`subagents = ${defaults.subagents}`);
+      expect(readme).toContain(
+        `stop_after_no_new = ${defaults.stopAfterNoNew}`,
+      );
+      expect(readme).toContain(
+        `max_discovery_runs = ${defaults.maxDiscoveryRuns}`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("marks findings as false positives without starting Codex", async () => {
@@ -1088,34 +1272,42 @@ describe("CLI", () => {
 
   test("rejects structured modes before starting interactive Codex commands", async () => {
     for (const [command, arguments_] of [
-      ["validate", ["finding", "--json"]],
-      ["patch", ["issue", "--format", "json"]],
-      ["login", ["--json"]],
-      ["login", ["status", "--format", "jsonl"]],
-      ["logout", ["--json"]],
+      ["validate", ["finding"]],
+      ["patch", ["issue"]],
+      ["login", []],
+      ["login", ["status"]],
+      ["logout", []],
     ] as const) {
-      let invoked = false;
-      const stdout = capture();
-      const stderr = capture(true);
+      for (const format of [
+        ["--json"],
+        ["--format", "json"],
+        ["--format=json"],
+        ["--format", "jsonl"],
+        ["--format=jsonl"],
+      ] as const) {
+        let invoked = false;
+        const stdout = capture();
+        const stderr = capture(true);
 
-      expect(
-        await main(
-          [command, ...arguments_],
-          stdout.stream,
-          stderr.stream,
-          dependencies({
-            onCodex: () => {
-              invoked = true;
-              return 0;
-            },
-          }),
-        ),
-      ).toBe(2);
-      expect(invoked).toBe(false);
-      expect(stdout.text()).toBe("");
-      expect(stderr.text()).toContain(
-        `${command} does not support noninteractive JSON output`,
-      );
+        expect(
+          await main(
+            [command, ...arguments_, ...format],
+            stdout.stream,
+            stderr.stream,
+            dependencies({
+              onCodex: () => {
+                invoked = true;
+                return 0;
+              },
+            }),
+          ),
+        ).toBe(2);
+        expect(invoked).toBe(false);
+        expect(stdout.text()).toBe("");
+        expect(stderr.text()).toContain(
+          `${command} does not support noninteractive JSON output; run it without --json, --format json, or --format jsonl.`,
+        );
+      }
     }
   });
 
@@ -1246,7 +1438,7 @@ describe("CLI", () => {
       expect([failed.status, failed.stdout, failed.stderr]).toEqual([
         2,
         "",
-        "codex-security: working directory is unavailable\n",
+        "working directory is unavailable\n",
       ]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1274,6 +1466,10 @@ describe("CLI", () => {
     expect(help.text()).toContain("Usage: codex-security scan [repository]");
     expect(help.text()).toContain("--path <array>");
     expect(help.text()).toContain("--max-cost <number>");
+    expect(help.text()).toContain("--workers <number>");
+    expect(help.text()).toContain("--subagents <number>");
+    expect(help.text()).toContain("--stop-after-no-new <number>");
+    expect(help.text()).toContain("--max-discovery-runs <number>");
     expect(help.text()).toContain("--model <string>");
     expect(help.text()).toContain(
       `OpenAI model to use (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
@@ -1284,6 +1480,10 @@ describe("CLI", () => {
     );
     expect(help.text()).toContain('model_reasoning_effort="high"');
     expect(help.text()).toContain(
+      "features.multi_agent_v2.max_concurrent_threads_per_session=4",
+    );
+    expect(help.text()).toContain("default: Codex Security state");
+    expect(help.text()).toContain(
       "codex-security scan . --model gpt-5.6-terra",
     );
     expect(help.text()).toContain(
@@ -1291,6 +1491,7 @@ describe("CLI", () => {
     );
     expect(help.text()).not.toContain("--provider");
     expect(help.text()).not.toContain("openai:gpt");
+    expect(help.text()).not.toContain("codex-security scan . --path src,tests");
     expect(help.text()).toContain("--format <toon|json|yaml|md|jsonl>");
   });
 
@@ -1316,6 +1517,26 @@ describe("CLI", () => {
     );
     expect(help.text()).toContain("--codex <array>");
     expect(help.text()).toContain('model_reasoning_effort="high"');
+    expect(help.text()).toContain(
+      "features.multi_agent_v2.max_concurrent_threads_per_session=4",
+    );
+    expect(help.text()).toContain("Concurrent repository scans.");
+    expect(help.text()).toContain(
+      "Default scan mode for repositories without a CSV mode.",
+    );
+    expect(help.text()).toContain(
+      "Codex Security plugin directory or ZIP (default: bundled plugin).",
+    );
+    expect(help.text()).toContain(
+      "Python interpreter (default: PYTHON or automatic discovery).",
+    );
+    expect(help.text()).toContain(
+      "codex-security bulk-scan repositories.csv " +
+        "--output-dir /path/outside/repositories/results " +
+        "--workers 4 --max-attempts 3",
+    );
+    expect(help.text()).not.toContain("--outputDir");
+    expect(help.text()).not.toContain("--maxAttempts");
     expect(help.text()).not.toContain("--provider");
     expect(stderr.text()).toBe("");
   });
@@ -1379,6 +1600,14 @@ describe("CLI", () => {
           "--knowledge-base=/shared/threat-models",
           "--mode",
           "deep",
+          "--workers",
+          "2",
+          "--subagents",
+          "0",
+          "--stop-after-no-new",
+          "3",
+          "--max-discovery-runs",
+          "10",
           "--plugin-path",
           "plugin.zip",
           "--python=/managed/python",
@@ -1399,6 +1628,10 @@ describe("CLI", () => {
     expect(pathOptions).toMatchObject({
       target: ["src", "--fixtures"],
       knowledgeBasePaths: ["/shared/architecture.pdf", "/shared/threat-models"],
+      workers: 2,
+      subagents: 0,
+      stopAfterNoNew: 3,
+      maxDiscoveryRuns: 10,
     });
     expect(pathConfig).toMatchObject({
       pluginPath: "plugin.zip",
@@ -1512,6 +1745,26 @@ describe("CLI", () => {
       [["scan", ".", "--base", "HEAD"], "--base requires --working-tree"],
       [["scan", ".", "--archive-existing"], "requires --output-dir"],
       [["scan", ".", "--max-cost=0"], "expected number to be >0"],
+      [
+        ["scan", ".", "--workers", "2"],
+        "Deep scan settings require --mode deep",
+      ],
+      [
+        ["scan", ".", "--mode", "deep", "--workers", "0"],
+        "expected number to be >0",
+      ],
+      [
+        ["scan", ".", "--mode", "deep", "--subagents", "-1"],
+        "expected number to be >=0",
+      ],
+      [
+        ["scan", ".", "--mode", "deep", "--stop-after-no-new", "0"],
+        "expected number to be >0",
+      ],
+      [
+        ["scan", ".", "--mode", "deep", "--max-discovery-runs", "0"],
+        "expected number to be >0",
+      ],
       [["scan", ".", "--path="], "--path must not be empty"],
       [["scan", ".", "--model="], "--model must not be empty"],
       [
@@ -1820,8 +2073,103 @@ describe("CLI", () => {
         await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
       ).toBe(2);
       expect(stdout.text()).toBe("");
-      expect(stderr.text()).toContain(`codex-security: ${message}\n`);
+      expect(stderr.text()).toContain(`${message}\n`);
+      expect(stderr.text()).not.toContain("codex-security:");
       expect(stderr.text()).not.toContain("model service could not be reached");
+    }
+  });
+
+  test("reports local input and filesystem failures without connectivity advice", async () => {
+    // https://github.com/openai/codex-security/issues/36 -- classification
+    // matches bare words such as "permission denied" anywhere in the message,
+    // so local failures were reported as credential or connectivity problems
+    // and their own text was discarded.
+    const failures: Array<[string, unknown]> = [
+      [
+        "EACCES from a read-only TMPDIR",
+        Object.assign(
+          new Error(
+            "EACCES: permission denied, mkdtemp '/tmp/openai-codex-security-home-XXXXXX'",
+          ),
+          { code: "EACCES" },
+        ),
+      ],
+      [
+        "EPERM writing the scan directory",
+        Object.assign(
+          new Error("EPERM: operation not permitted, mkdir '/out/scan'"),
+          { code: "EPERM" },
+        ),
+      ],
+      [
+        "output directory rejected",
+        new OutputDirectoryError(
+          "Scan output directory must not be accessible to other users (chmod 700): /out",
+        ),
+      ],
+      [
+        "path target naming a 403 directory",
+        new InvalidTargetError("Path target does not exist: src/403/client.ts"),
+      ],
+      [
+        "git ref naming a forbidden branch",
+        new InvalidTargetError("unknown Git ref: origin/forbidden-paths"),
+      ],
+      [
+        "python interpreter unavailable",
+        new PluginPythonUnavailableError(
+          "The configured plugin Python interpreter is unavailable or unusable: /usr/bin/python3",
+        ),
+      ],
+    ];
+
+    for (const [, failure] of failures) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async () => {
+          throw failure;
+        },
+        preflight: async () => fakePreflight(),
+        close: async () => {},
+      });
+
+      expect(
+        await main(["scan", "."], stdout.stream, stderr.stream, deps),
+      ).toBe(2);
+      expect(stderr.text()).toContain((failure as Error).message);
+      expect(stderr.text()).not.toContain("cannot access the configured model");
+      expect(stderr.text()).not.toContain("Authentication failed");
+      expect(stderr.text()).not.toContain("reached its rate limit");
+    }
+  });
+
+  test("keeps model authorization advice for genuine transport failures", async () => {
+    // The bypass must not swallow real 401/403 handling, and the advice must
+    // still replace upstream text that can name the organization or project.
+    for (const [detail, expected] of [
+      ["401 invalid API key for org-private", "Authentication failed"],
+      [
+        "403 model access denied for org-private",
+        "cannot access the configured model",
+      ],
+    ] as const) {
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async () => {
+          throw new CodexSecurityError(detail);
+        },
+        preflight: async () => fakePreflight(),
+        close: async () => {},
+      });
+
+      expect(
+        await main(["scan", "."], capture().stream, stderr.stream, deps),
+      ).toBe(2);
+      expect(stderr.text()).toContain(expected);
+      expect(stderr.text()).not.toContain("org-private");
     }
   });
 
@@ -1848,6 +2196,100 @@ describe("CLI", () => {
     );
     expect(stderr.text()).not.toContain("SYNTHETIC_KEY_123");
     expect(stderr.text()).not.toContain("model service could not be reached");
+  });
+
+  test("redacts quoted multiword credentials and private-key assignments", () => {
+    expect(
+      redactedErrorMessage(
+        'password="correct horse battery staple" private_key=SYNTHETIC_PRIVATE_KEY_123',
+      ),
+    ).toBe('password="[redacted]" private_key=[redacted]');
+    expect(
+      redactedErrorMessage(
+        '{"client_secret_value":"correct horse battery staple","safe":"visible"}',
+      ),
+    ).toBe('{"client_secret_value":"[redacted]","safe":"visible"}');
+    expect(
+      redactedErrorMessage(
+        '{"clientSecretValue":"camel case secret","accessTokenValue":"camel case token"}',
+      ),
+    ).toBe(
+      '{"clientSecretValue":"[redacted]","accessTokenValue":"[redacted]"}',
+    );
+    expect(
+      redactedErrorMessage(
+        "clientSecretValue=SYNTHETIC_CAMEL_SECRET accessTokenValue=SYNTHETIC_CAMEL_TOKEN https://example.test/?clientSecretValue=SYNTHETIC_CAMEL_QUERY",
+      ),
+    ).toBe(
+      "clientSecretValue=[redacted] accessTokenValue=[redacted] https://example.test/?clientSecretValue=[redacted]",
+    );
+    expect(
+      redactedErrorMessage(
+        '{\\"access_token_value\\":\\"another horse battery staple\\"}',
+      ),
+    ).toBe('{\\"access_token_value\\":\\"[redacted]\\"}');
+    expect(
+      redactedErrorMessage(
+        'authorization="opaque secret value" _auth=Zm9vOmJhcg== https://example.test/?authorization=opaque%20query%20secret',
+      ),
+    ).toBe(
+      'authorization="[redacted]" _auth=[redacted] https://example.test/?authorization=[redacted]',
+    );
+    for (const [authorization, redacted] of [
+      [
+        "Authorization: ApiKey SYNTHETIC_APIKEY_SECRET",
+        "Authorization: ApiKey [redacted]",
+      ],
+      ["auth=Custom%20SYNTHETIC_CUSTOM_SECRET", "auth=Custom%20[redacted]"],
+      [
+        "Authorization: Digest+SYNTHETIC_DIGEST_SECRET",
+        "Authorization: Digest+[redacted]",
+      ],
+      [
+        "client_authorization_value=ApiKey SYNTHETIC_SUFFIXED_SECRET",
+        "client_authorization_value=ApiKey [redacted]",
+      ],
+      ["Authorization: ApiKey dGVzdA==", "Authorization: ApiKey [redacted]"],
+      ["Authorization: ApiKey dGVzdA=", "Authorization: ApiKey [redacted]"],
+      ["Authorization: ApiKey key=SECRET", "Authorization: ApiKey [redacted]"],
+      ["auth=Custom key=SECRET", "auth=Custom [redacted]"],
+      [
+        "client_auth_token=Custom dGVzdA==",
+        "client_auth_token=Custom [redacted]",
+      ],
+    ] as const) {
+      expect(redactedErrorMessage(authorization)).toBe(redacted);
+    }
+    expect(redactedErrorMessage('password="correct horse battery staple')).toBe(
+      'password="[redacted]',
+    );
+    let encoded: string | { password: string } = {
+      password: 'foo "bar" baz',
+    };
+    for (let depth = 1; depth <= 3; depth += 1) {
+      encoded = JSON.stringify(encoded);
+      const redacted = redactedErrorMessage(encoded);
+      expect(redacted).not.toContain("foo");
+      expect(redacted).not.toContain("bar");
+      expect(redacted).not.toContain("baz");
+      let decoded: unknown = redacted;
+      for (let layer = 0; layer < depth; layer += 1) {
+        decoded = JSON.parse(decoded as string);
+      }
+      expect(decoded).toEqual({ password: "[redacted]" });
+    }
+    for (const separator of ["\n", "\\n"]) {
+      expect(
+        redactedErrorMessage(
+          `private_key=-----BEGIN PRIVATE KEY-----${separator}MII_SYNTHETIC_PRIVATE_KEY${separator}-----END PRIVATE KEY----- safe=value`,
+        ),
+      ).toBe("private_key=[redacted] safe=value");
+      expect(
+        redactedErrorMessage(
+          `private_key=-----BEGIN PRIVATE KEY-----${separator}MII_SYNTHETIC_TRUNCATED_PRIVATE_KEY`,
+        ),
+      ).toBe("private_key=[redacted]");
+    }
   });
 
   test("reports database connection failures without claiming the model network failed", async () => {
@@ -1885,6 +2327,7 @@ describe("CLI", () => {
       cached_input_tokens: 200,
       output_tokens: 30,
     });
+    result.manifest.scan.completedAt = "2026-01-01T00:06:37Z";
 
     expect(
       await main(
@@ -1897,16 +2340,51 @@ describe("CLI", () => {
     expect(stdout.text()).toBe("");
     expect(stderr.text()).toContain("Scan complete");
     expect(stderr.text()).toContain(
-      "Findings: 1 (1 high). Coverage: complete.",
+      [
+        `  REPORT    ${result.reportPath}`,
+        "",
+        "  FINDINGS  1 (1 high)",
+        "  COVERAGE  complete",
+        "  ELAPSED   6m 37s",
+        "  TOKENS    1,250 input, 200 cached, 30 output",
+        "  COST      $0.00625",
+        "  RESULTS   /tmp/scan",
+      ].join("\n"),
     );
-    expect(stderr.text()).toContain("Elapsed: 1s.");
-    expect(stderr.text()).toContain(
-      "Tokens: 1,250 input, 200 cached, 30 output.",
-    );
-    expect(stderr.text()).toContain("Estimated cost: $0.00625 USD.");
-    expect(stderr.text()).toContain(`Report: ${result.reportPath}`);
-    expect(stderr.text()).toContain("Results: /tmp/scan");
+    expect(stderr.text()).not.toContain("codex-security:");
     expect(stderr.text()).not.toContain("Next:");
+  });
+
+  test("styles terminal scan summaries and respects color settings", async () => {
+    for (const [environment, color] of [
+      [{}, true],
+      [{ NO_COLOR: "1" }, false],
+      [{ TERM: "dumb" }, false],
+    ] as const) {
+      const stdout = capture();
+      const stderr = capture(true);
+      const result = fakeResult(["medium"]);
+
+      expect(
+        await main(
+          ["scan"],
+          stdout.stream,
+          stderr.stream,
+          dependencies({ environment, result }),
+        ),
+      ).toBe(0);
+
+      if (color) {
+        expect(stderr.text()).toContain("\u001B[1;36mREPORT\u001B[0m");
+        expect(stderr.text()).toContain(
+          `\u001B[4m${result.reportPath}\u001B[0m`,
+        );
+        expect(stderr.text()).toContain("\u001B[33m1 (1 medium)\u001B[0m");
+      } else {
+        expect(stderr.text()).toContain(`  REPORT    ${result.reportPath}`);
+        expect(stderr.text()).not.toContain("\u001B[1;36mREPORT");
+      }
+    }
   });
 
   test("prints complete scan results only when explicitly requested", async () => {
@@ -2128,15 +2606,16 @@ describe("CLI", () => {
     ).toBe(0);
     expect(JSON.parse(stdout.text())).toEqual(result.toJSON());
     expect(stderr.text()).toContain(
-      "Findings: 4 (1 critical, 2 high, 1 informational). Coverage: complete.",
+      "FINDINGS  4 (1 critical, 2 high, 1 informational)",
     );
-    expect(stderr.text()).toContain("Elapsed: 1s.");
+    expect(stderr.text()).toContain("COVERAGE  complete");
+    expect(stderr.text()).toContain("ELAPSED   1s");
     expect(stderr.text()).toContain(
-      "Tokens: 1,250 input, 200 cached, 30 output.",
+      "TOKENS    1,250 input, 200 cached, 30 output",
     );
-    expect(stderr.text()).toContain("Estimated cost: $0.00625 USD.");
-    expect(stderr.text()).toContain(`Report: ${result.reportPath}`);
-    expect(stderr.text()).toContain("Results: /tmp/scan");
+    expect(stderr.text()).toContain("COST      $0.00625");
+    expect(stderr.text()).toContain(`REPORT    ${result.reportPath}`);
+    expect(stderr.text()).toContain("RESULTS   /tmp/scan");
     expect(stderr.text()).not.toContain("Next:");
   });
 
@@ -2267,7 +2746,7 @@ describe("CLI", () => {
       "Worker delegation unavailable during file review; continuing without delegated workers.",
     );
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("Findings: 0. Coverage: complete.");
+    expect(stderr.text()).toContain("FINDINGS  0\n  COVERAGE  complete");
   });
 
   test("validates a dry run without starting a scan", async () => {
@@ -2523,7 +3002,7 @@ describe("CLI", () => {
       await main(["scan", "."], stdout.stream, stderr.stream, failing),
     ).toBe(2);
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("codex-security: invalid scan request\n");
+    expect(stderr.text()).toContain("invalid scan request\n");
     expect(stderr.text()).not.toContain("Running scan");
     expect(stderr.text()).not.toContain("CodexSecurityError");
   });
@@ -2548,7 +3027,7 @@ describe("CLI", () => {
       ),
     ).toBe(2);
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("codex-security: invalid scan request\n");
+    expect(stderr.text()).toContain("invalid scan request\n");
 
     const unavailableCwd = dependencies();
     unavailableCwd.currentDirectory = () => {
@@ -2676,6 +3155,7 @@ describe("CLI", () => {
       "Isolated Codex runtime directory must be outside the scanned directory and any enclosing Git worktree.",
     );
     expect(stderr.text()).toContain(`Partial output was kept at ${partial}.`);
+    expect(stderr.text()).not.toContain("codex-security:");
   });
 
   test("redacts credentials embedded in protected-root diagnostics", async () => {
@@ -2736,8 +3216,7 @@ describe("CLI", () => {
       ).toBe(2);
       expect(stdout.text()).toBe("");
       expect(stderr.text()).toBe(
-        "[00:00] Preparing scan\n" +
-          `codex-security: scan failed ${REDACTED_CREDENTIALS}\n`,
+        "[00:00] Preparing scan\n" + `scan failed ${REDACTED_CREDENTIALS}\n`,
       );
     }
   });
