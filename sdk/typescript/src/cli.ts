@@ -22,8 +22,7 @@ import {
   win32,
 } from "node:path";
 import { cwd } from "node:process";
-import { createInterface } from "node:readline";
-import { Readable, Writable as NodeWritable } from "node:stream";
+import { Writable as NodeWritable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ModelReasoningEffort } from "@openai/codex-sdk";
@@ -33,6 +32,7 @@ import {
   classifyConnectionFailure,
   CodexSecurity,
   scanAuthentication,
+  type DeepScanOptions,
   type ScanAuthMode,
   type ScanAuthentication,
   type ScanOptions,
@@ -56,7 +56,12 @@ import {
 import { formatUsd } from "./cost.js";
 import {
   CodexSecurityError,
+  ConfigurationError,
+  InvalidTargetError,
+  OutputDirectoryError,
   OutputInsideProtectedRootError,
+  PluginPythonUnavailableError,
+  redactedErrorMessage,
   ScanInterruptedError,
 } from "./errors.js";
 import type { SeverityLevel } from "./models.js";
@@ -102,6 +107,10 @@ const MAX_CODEX_OVERRIDE_VALUE_LENGTH = 64 * 1_024;
 const MAX_CODEX_OVERRIDE_DEPTH = 64;
 const MAX_SKILL_INPUT_BYTES = 1_024 * 1_024;
 const MAX_SKILL_INPUT_COUNT = 64;
+const MAX_SKILL_EVENT_BYTES = 1_024 * 1_024;
+const MAX_SKILL_RESPONSE_BYTES = 256 * 1_024;
+const SKILL_OUTPUT_LIMIT_MESSAGE =
+  "Codex skill output exceeded the 1 MiB event or 256 KiB response safety limit.";
 const WINDOWS_NETWORK_PATH = /^[\\/]{2}/u;
 const WINDOWS_LOCAL_DEVICE_ROOT =
   /^[\\/]{2}[?.][\\/](?:[A-Za-z]:|Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}|GLOBALROOT[\\/]Device[\\/]HarddiskVolume[0-9]+)(?=[\\/]|$)/iu;
@@ -109,6 +118,7 @@ const SCAN_HISTORY_OUTPUT_OPTION =
   /^--(?:format|filter-output|full-output|token-count|token-limit|token-offset)(?:=|$)/u;
 const HIDE_CURSOR = "\u001B[?25l";
 const SHOW_CURSOR = "\u001B[?25h";
+const CHILD_TERMINATION_GRACE_MS = 1_000;
 
 type Writable = Pick<NodeJS.WriteStream, "write"> & {
   readonly isTTY?: boolean;
@@ -165,6 +175,9 @@ const VALUE_OPTIONS = new Set([
   "--fail-on-severity",
   "--max-cost",
   "--workers",
+  "--subagents",
+  "--stop-after-no-new",
+  "--max-discovery-runs",
   "--max-attempts",
   "--export-format",
   "--output",
@@ -192,7 +205,34 @@ function effortOption() {
     );
 }
 
-interface ScanArguments {
+const DEEP_SCAN_OPTION_SCHEMAS = {
+  workers: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum concurrent deep-scan discovery workers."),
+  subagents: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe("Subagents available to each deep-scan worker."),
+  stopAfterNoNew: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Stop after this many runs find no new issues."),
+  maxDiscoveryRuns: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum deep-scan discovery runs."),
+};
+
+interface ScanArguments extends DeepScanOptions {
   auth?: ScanAuthMode;
   repository?: string;
   paths: string[];
@@ -434,13 +474,31 @@ export async function runCodexSkillCommand(
     windowsHide: true,
   });
   let requestedSignal: SignalName | null = null;
+  let skillOutputLimitExceeded = false;
+  let forcedTermination: ReturnType<typeof setTimeout> | undefined;
+  let forceStatusCompletion: (() => void) | null = null;
+  let forceCaptureCompletion: (() => void) | null = null;
+  let invocationStatus: Promise<number> | undefined;
+  const requestTermination = (signal: SignalName): void => {
+    requestedSignal = signal;
+    invocation.kill(signal);
+    if (forcedTermination !== undefined) return;
+    forcedTermination = setTimeout(() => {
+      forcedTermination = undefined;
+      if (invocation.exitCode === null && invocation.signalCode === null) {
+        invocation.kill("SIGKILL");
+      }
+      forceCaptureCompletion?.();
+      invocation.stdout?.destroy();
+      invocation.stderr?.destroy();
+      forceStatusCompletion?.();
+    }, CHILD_TERMINATION_GRACE_MS);
+  };
   const onInterrupt = (): void => {
-    requestedSignal = "SIGINT";
-    invocation.kill("SIGINT");
+    requestTermination("SIGINT");
   };
   const onTerminate = (): void => {
-    requestedSignal = "SIGTERM";
-    invocation.kill("SIGTERM");
+    requestTermination("SIGTERM");
   };
   process.on("SIGINT", onInterrupt);
   process.on("SIGTERM", onTerminate);
@@ -452,25 +510,45 @@ export async function runCodexSkillCommand(
     const captured =
       output === undefined || invocation.stdout === null
         ? Promise.resolve(undefined)
-        : readSkillCommandOutput(invocation.stdout);
-    const [status, events] = await Promise.all([
-      new Promise<number>((resolve, reject) => {
-        invocation.once("error", reject);
-        invocation.once(
-          output === undefined ? "exit" : "close",
-          (code, signal) => {
-            resolve(
-              requestedSignal === "SIGINT" || signal === "SIGINT"
-                ? 130
-                : requestedSignal === "SIGTERM" || signal === "SIGTERM"
-                  ? 143
-                  : code ?? 1,
-            );
-          },
+        : Promise.race([
+            readSkillCommandOutput(invocation.stdout, () => {
+              skillOutputLimitExceeded = true;
+              requestTermination("SIGTERM");
+            }),
+            new Promise<undefined>((resolve) => {
+              forceCaptureCompletion = () => resolve(undefined);
+            }),
+          ]);
+    invocationStatus = new Promise<number>((resolve, reject) => {
+      let completed = false;
+      const complete = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+      ): void => {
+        if (completed) return;
+        completed = true;
+        forceStatusCompletion = null;
+        resolve(
+          requestedSignal === "SIGINT" || signal === "SIGINT"
+            ? 130
+            : requestedSignal === "SIGTERM" || signal === "SIGTERM"
+              ? 143
+              : code ?? 1,
         );
-      }),
-      captured,
-    ]);
+      };
+      forceStatusCompletion = () => complete(null, null);
+      invocation.once("error", (error) => {
+        if (completed) return;
+        completed = true;
+        forceStatusCompletion = null;
+        reject(error);
+      });
+      invocation.once(output === undefined ? "exit" : "close", complete);
+    });
+    const [status, events] = await Promise.all([invocationStatus, captured]);
+    if (skillOutputLimitExceeded) {
+      throw new CodexSecurityError(SKILL_OUTPUT_LIMIT_MESSAGE);
+    }
     if (output === undefined || status === 130 || status === 143) return status;
     if (status !== 0) {
       await writeCliOutput(
@@ -491,9 +569,13 @@ export async function runCodexSkillCommand(
   } catch (error) {
     invocation.stdout?.destroy();
     invocation.stderr?.destroy();
-    invocation.kill();
+    requestTermination("SIGTERM");
+    await invocationStatus?.catch(() => undefined);
     throw error;
   } finally {
+    if (forcedTermination !== undefined) clearTimeout(forcedTermination);
+    forceStatusCompletion = null;
+    forceCaptureCompletion = null;
     process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onTerminate);
   }
@@ -601,16 +683,48 @@ export async function main(
   let renderedHistory: string | undefined;
   const history = async (
     args: readonly string[],
-    select: (value: JsonObject) => JsonObject = (value) => value,
+    select: (value: JsonObject) => JsonObject | Promise<JsonObject> = (value) =>
+      value,
   ): Promise<JsonObject | undefined> => {
     try {
-      return select(await dependencies.runWorkbench(args));
+      return await select(await dependencies.runWorkbench(args));
     } catch (error) {
-      errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+      errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
       exitCode = 2;
       return undefined;
     }
   };
+  const matchScanPair = async (
+    beforeId: string,
+    afterId: string,
+    force = false,
+  ): Promise<JsonObject | undefined> =>
+    history(
+      [
+        "compare-scans",
+        "--before-scan-id",
+        beforeId,
+        "--after-scan-id",
+        afterId,
+        "--include-matching-inputs",
+      ],
+      async ({ matchingCached, matchingInputs, ...comparison }) => {
+        if (matchingCached && !force) return comparison;
+        return await dependencies.runWorkbench([
+          "save-scan-comparison",
+          "--before-scan-id",
+          beforeId,
+          "--after-scan-id",
+          afterId,
+          "--matches-json",
+          JSON.stringify(
+            await dependencies.matchFindings(
+              matchingInputs as JsonObject & ScanComparisonInput,
+            ),
+          ),
+        ]);
+      },
+    );
   const presentHistory = (
     result: JsonObject | undefined,
     command: HistoryCommand,
@@ -774,7 +888,7 @@ export async function main(
           ]);
           scanArguments = scanArgumentsFromRecipe(recipe, args.scanId);
         } catch (error) {
-          const message = cliErrorMessage(error);
+          const message = redactedErrorMessage(error);
           errorOutput.write(`codex-security: ${message}\n`);
           exitCode = 2;
           return incurError({
@@ -831,46 +945,21 @@ export async function main(
               format,
             );
           }
-          const comparison = await history([
-            "compare-scans",
-            "--before-scan-id",
-            args.beforeId!,
-            "--after-scan-id",
-            args.afterId!,
-            "--include-matching-inputs",
-          ]);
-          if (comparison === undefined) return undefined;
-          const { matchingCached, matchingInputs, ...visibleComparison } =
-            comparison;
-          if (matchingCached && !options.force) {
-            return presentHistory(visibleComparison, "compare", format);
-          }
-
-          const matching = await dependencies.matchFindings(
-            matchingInputs as JsonObject & ScanComparisonInput,
-          );
           return presentHistory(
-            await history([
-              "save-scan-comparison",
-              "--before-scan-id",
-              args.beforeId!,
-              "--after-scan-id",
-              args.afterId!,
-              "--matches-json",
-              JSON.stringify(matching),
-            ]),
+            await matchScanPair(args.beforeId!, args.afterId!, options.force),
             "compare",
             format,
           );
         } catch (error) {
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
       },
     })
     .command("compare", {
-      description: "Compare findings and coverage using saved matches.",
+      description: "Match and compare findings and coverage between scans.",
+      destructive: true,
       mcp: false,
       args: z.object({
         beforeId: z.string().min(1).describe("Earlier saved scan identifier."),
@@ -879,14 +968,7 @@ export async function main(
       output: z.record(z.string(), z.unknown()).optional(),
       async run({ args, format }) {
         return presentHistory(
-          await history([
-            "compare-scans",
-            "--before-scan-id",
-            args.beforeId,
-            "--after-scan-id",
-            args.afterId,
-            "--require-matches",
-          ]),
+          await matchScanPair(args.beforeId, args.afterId),
           "compare",
           format,
         );
@@ -948,6 +1030,7 @@ export async function main(
             .enum(["standard", "deep"])
             .default("standard")
             .describe("Scan mode; deep supports repository and path targets."),
+          ...DEEP_SCAN_OPTION_SCHEMAS,
           model: optionValue("--model")
             .optional()
             .describe(
@@ -1012,6 +1095,15 @@ export async function main(
           (options) =>
             !options.archiveExisting || options.outputDir !== undefined,
           { message: "--archive-existing requires --output-dir." },
+        )
+        .refine(
+          (options) =>
+            options.mode === "deep" ||
+            (options.workers === undefined &&
+              options.subagents === undefined &&
+              options.stopAfterNoNew === undefined &&
+              options.maxDiscoveryRuns === undefined),
+          { message: "Deep scan settings require --mode deep." },
         ),
       examples: [
         { args: { repository: "." } },
@@ -1051,6 +1143,10 @@ export async function main(
             head: options.head,
             base: options.base,
             mode: options.mode,
+            workers: options.workers,
+            subagents: options.subagents,
+            stopAfterNoNew: options.stopAfterNoNew,
+            maxDiscoveryRuns: options.maxDiscoveryRuns,
             model: options.model,
             effort: options.effort,
             outputDir: options.outputDir,
@@ -1168,7 +1264,7 @@ export async function main(
             failOnSeverity: options.failOnSeverity,
           };
         } catch (error) {
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
@@ -1198,6 +1294,10 @@ export async function main(
           .describe(
             "Resumable results directory; required with a repository CSV.",
           ),
+        knowledgeBase: z
+          .array(optionValue("--knowledge-base"))
+          .default([])
+          .describe("Read shared security docs for every repository."),
         workers: z
           .number()
           .int()
@@ -1269,13 +1369,15 @@ export async function main(
               if (
                 argument === "--model" ||
                 argument === "--effort" ||
-                argument === "--codex"
+                argument === "--codex" ||
+                argument === "--knowledge-base"
               ) {
                 optionIndex += 2;
               } else if (
                 argument.startsWith("--model=") ||
                 argument.startsWith("--effort=") ||
-                argument.startsWith("--codex=")
+                argument.startsWith("--codex=") ||
+                argument.startsWith("--knowledge-base=")
               ) {
                 optionIndex += 1;
               } else {
@@ -1284,7 +1386,7 @@ export async function main(
             }
             if (argv[0] !== "bulk-scan" || optionIndex !== argv.length) {
               throw new Error(
-                "Run 'codex-security bulk-scan [--model MODEL] [--effort EFFORT] [--codex KEY=VALUE]' to discover repositories, or provide a CSV and --output-dir.",
+                "Run 'codex-security bulk-scan [--model MODEL] [--effort EFFORT] [--codex KEY=VALUE] [--knowledge-base PATH]' to discover repositories, or provide a CSV and --output-dir.",
               );
             }
             const wizard = await runBulkScanWizard(
@@ -1316,6 +1418,7 @@ export async function main(
             workers: options.workers,
             mode: options.mode,
             maxAttempts: options.maxAttempts,
+            knowledgeBasePaths: options.knowledgeBase,
             config: {
               pluginPath: options.pluginPath,
               pythonPath: options.python,
@@ -1329,7 +1432,7 @@ export async function main(
             signal: controller.signal,
             onProgress: ({ repository, status, attempt, error }) => {
               errorOutput.write(
-                `codex-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${cliErrorMessage(error)}`}\n`,
+                `codex-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${redactedErrorMessage(error)}`}\n`,
               );
             },
           });
@@ -1341,7 +1444,7 @@ export async function main(
             (error instanceof Error && error.name === "ExitPromptError"
               ? 130
               : 2);
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
         } finally {
           dependencies.removeSignalListener("SIGINT", onInterrupt);
           dependencies.removeSignalListener("SIGTERM", onTerminate);
@@ -1445,7 +1548,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
         }
       },
     })
@@ -1481,7 +1584,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
         }
       },
     })
@@ -1512,7 +1615,9 @@ export async function main(
             ? await dependencies.prepareAuthenticationHome(
                 dependencies.environment,
               )
-            : codexSecurityCredentialHome(dependencies.environment);
+            : await prepareCodexSecurityCredentialHome(
+                dependencies.environment,
+              );
         const authenticationEnvironment = {
           ...dependencies.environment,
           CODEX_HOME: credentialHome,
@@ -1588,7 +1693,9 @@ export async function main(
             ? await dependencies.prepareAuthenticationHome(
                 dependencies.environment,
               )
-            : codexSecurityCredentialHome(dependencies.environment);
+            : await prepareCodexSecurityCredentialHome(
+                dependencies.environment,
+              );
         const authenticationEnvironment = {
           ...dependencies.environment,
           CODEX_HOME: credentialHome,
@@ -1666,7 +1773,7 @@ export async function main(
   if (frameworkExit !== undefined) {
     if (exitCode !== 0) return exitCode;
     errorOutput.write(
-      `codex-security: ${cliErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
+      `codex-security: ${redactedErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
     );
     return 2;
   }
@@ -1675,7 +1782,7 @@ export async function main(
     await writeCliOutput(output, renderedHistory ?? frameworkOutput);
     return exitCode;
   } catch (error) {
-    errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -1802,6 +1909,24 @@ function scanArgumentsFromRecipe(
       "The saved scan recipe contains an invalid cost limit.",
     );
   }
+  const deepScan = z
+    .object(DEEP_SCAN_OPTION_SCHEMAS)
+    .optional()
+    .safeParse(recipe["deepScan"]);
+  if (!deepScan.success) {
+    throw new CodexSecurityError(
+      "The saved scan recipe contains invalid deep scan settings.",
+    );
+  }
+  if (
+    mode !== "deep" &&
+    deepScan.data !== undefined &&
+    Object.keys(deepScan.data).length > 0
+  ) {
+    throw new CodexSecurityError(
+      "The saved scan recipe contains deep scan settings for a standard scan.",
+    );
+  }
   return {
     repository,
     paths,
@@ -1811,6 +1936,7 @@ function scanArgumentsFromRecipe(
     head: kind === "refs" ? head ?? "HEAD" : undefined,
     base: kind === "working_tree" ? reference : undefined,
     mode,
+    ...deepScan.data,
     archiveExisting: false,
     codex: [],
     codexOverrides: config,
@@ -2213,23 +2339,33 @@ async function runSkill(
 
 export async function readSkillCommandOutput(
   stream: AsyncIterable<Buffer | string>,
+  onLimitExceeded?: () => void,
 ): Promise<{ message?: string; error?: string; malformed: boolean }> {
   let message: string | undefined;
   let error: string | undefined;
   let malformed = false;
+  let exceeded = false;
+  const markExceeded = (): void => {
+    if (exceeded) return;
+    exceeded = true;
+    onLimitExceeded?.();
+  };
 
-  for await (const line of createInterface({ input: Readable.from(stream) })) {
-    if (line.trim().length === 0) continue;
+  const readLine = (bytes: Buffer): void => {
+    const content =
+      bytes.at(-1) === 0x0d ? bytes.subarray(0, bytes.length - 1) : bytes;
+    const line = content.toString("utf8");
+    if (line.trim().length === 0) return;
     let event: unknown;
     try {
       event = JSON.parse(line);
     } catch {
       malformed = true;
-      continue;
+      return;
     }
     if (typeof event !== "object" || event === null) {
       malformed = true;
-      continue;
+      return;
     }
     const value = event as Record<string, unknown>;
     if (value["type"] === "item.completed") {
@@ -2242,7 +2378,11 @@ export async function readSkillCommandOutput(
         "text" in item &&
         typeof item.text === "string"
       ) {
-        message = item.text;
+        if (Buffer.byteLength(item.text, "utf8") > MAX_SKILL_RESPONSE_BYTES) {
+          markExceeded();
+        } else {
+          message = item.text;
+        }
       }
     } else if (value["type"] === "turn.failed") {
       const detail = value["error"];
@@ -2252,15 +2392,63 @@ export async function readSkillCommandOutput(
         "message" in detail &&
         typeof detail.message === "string"
       ) {
-        error = detail.message;
+        if (
+          Buffer.byteLength(detail.message, "utf8") > MAX_SKILL_RESPONSE_BYTES
+        ) {
+          markExceeded();
+        } else {
+          error = detail.message;
+        }
       }
     } else if (
       value["type"] === "error" &&
       typeof value["message"] === "string"
     ) {
-      error = value["message"];
+      if (
+        Buffer.byteLength(value["message"], "utf8") > MAX_SKILL_RESPONSE_BYTES
+      ) {
+        markExceeded();
+      } else {
+        error = value["message"];
+      }
+    }
+  };
+
+  const pending = Buffer.alloc(MAX_SKILL_EVENT_BYTES);
+  let pendingBytes = 0;
+  let discardingOversizedLine = false;
+  for await (const rawChunk of stream) {
+    const chunk = Buffer.isBuffer(rawChunk)
+      ? rawChunk
+      : Buffer.from(rawChunk, "utf8");
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start);
+      const end = newline === -1 ? chunk.length : newline;
+      const segment = chunk.subarray(start, end);
+      if (!discardingOversizedLine) {
+        if (pendingBytes + segment.length > MAX_SKILL_EVENT_BYTES) {
+          markExceeded();
+          discardingOversizedLine = true;
+          pendingBytes = 0;
+        } else if (segment.length > 0) {
+          segment.copy(pending, pendingBytes);
+          pendingBytes += segment.length;
+        }
+      }
+      if (newline === -1) break;
+      if (!discardingOversizedLine) {
+        readLine(pending.subarray(0, pendingBytes));
+      }
+      pendingBytes = 0;
+      discardingOversizedLine = false;
+      start = newline + 1;
     }
   }
+  if (!discardingOversizedLine && pendingBytes > 0) {
+    readLine(pending.subarray(0, pendingBytes));
+  }
+  if (exceeded) throw new CodexSecurityError(SKILL_OUTPUT_LIMIT_MESSAGE);
   return {
     ...(message === undefined ? {} : { message }),
     ...(error === undefined ? {} : { error }),
@@ -2391,7 +2579,7 @@ async function runExport(
     }
     return 0;
   } catch (error) {
-    errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`codex-security: ${redactedErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -2520,6 +2708,10 @@ async function runScan(
       target,
       knowledgeBasePaths: arguments_.knowledgeBasePaths,
       mode: arguments_.mode,
+      workers: arguments_.workers,
+      subagents: arguments_.subagents,
+      stopAfterNoNew: arguments_.stopAfterNoNew,
+      maxDiscoveryRuns: arguments_.maxDiscoveryRuns,
       outputDir: arguments_.outputDir,
       archiveExisting: arguments_.archiveExisting,
       parentScanId: arguments_.parentScanId,
@@ -2539,7 +2731,7 @@ async function runScan(
       onOutputArchived: (archiveDir) => {
         progress?.stopTimer();
         errorOutput.write(
-          `Moved existing results to: ${cliErrorMessage(archiveDir)}\n`,
+          `Moved existing results to: ${redactedErrorMessage(archiveDir)}\n`,
         );
       },
       signal: preparationAbortController.signal,
@@ -2600,12 +2792,12 @@ async function runScan(
       },
       onWarning: (warning) => {
         errorOutput.write(
-          `codex-security: warning: ${cliErrorMessage(warning)}\n`,
+          `codex-security: warning: ${redactedErrorMessage(warning)}\n`,
         );
       },
       onObserverError: (observer, error) => {
         errorOutput.write(
-          `codex-security: warning: ${observer} observer failed: ${cliErrorMessage(error)}\n`,
+          `codex-security: warning: ${observer} observer failed: ${redactedErrorMessage(error)}\n`,
         );
       },
     };
@@ -2642,19 +2834,15 @@ async function runScan(
   if (failed) {
     const message =
       failure instanceof OutputInsideProtectedRootError
-        ? cliErrorMessage(protectedRootErrorMessage(failure))
+        ? redactedErrorMessage(protectedRootErrorMessage(failure))
         : scanFailureMessage(failure, selectedAuthentication);
-    if (failure instanceof OutputInsideProtectedRootError) {
-      errorOutput.write(`${message}\n`);
-    } else {
-      errorOutput.write(`codex-security: ${message}\n`);
-    }
+    errorOutput.write(`${message}\n`);
     if (failure instanceof ScanInterruptedError) {
       return { exitCode: 2, error: message };
     }
     if (scanDir !== null) {
       errorOutput.write(
-        `codex-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+        `Partial output was kept at ${redactedErrorMessage(scanDir)}.\n`,
       );
     }
     return { exitCode: 2, error: message };
@@ -2664,7 +2852,7 @@ async function runScan(
     return { exitCode: 0, data: { dryRun: true, ...preflight } };
   }
   if (result === null) {
-    errorOutput.write("codex-security: scan completed without a result\n");
+    errorOutput.write("scan completed without a result\n");
     return { exitCode: 2, error: "Scan completed without a result." };
   }
   const threshold = arguments_.failOnSeverity;
@@ -2681,7 +2869,14 @@ async function runScan(
   ).length;
   const incomplete = result.coverage.completeness !== "complete";
   progress?.stage("Scan complete");
-  printScanSummary(result, progress, errorOutput);
+  printScanSummary(
+    result,
+    progress,
+    errorOutput,
+    progress?.interactive === true &&
+      dependencies.environment["NO_COLOR"] === undefined &&
+      dependencies.environment["TERM"] !== "dumb",
+  );
   if (incomplete) {
     errorOutput.write(
       threshold === undefined
@@ -2693,10 +2888,61 @@ async function runScan(
   return { exitCode: blockingCount > 0 ? 1 : 0, data: result.toJSON() };
 }
 
+// Filesystem and OS syscall failures cannot originate from the model transport,
+// so they must never be rewritten as connectivity or credential advice. Network
+// errno codes are deliberately absent: they are genuine transport failures.
+const LOCAL_SYSCALL_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "EEXIST",
+  "EFBIG",
+  "EIO",
+  "EISDIR",
+  "ELOOP",
+  "EMFILE",
+  "ENAMETOOLONG",
+  "ENFILE",
+  "ENOENT",
+  "ENOMEM",
+  "ENOSPC",
+  "ENOTDIR",
+  "ENOTEMPTY",
+  "EPERM",
+  "EROFS",
+  "EXDEV",
+]);
+
+function isLocalScanFailure(error: unknown): boolean {
+  if (
+    error instanceof InvalidTargetError ||
+    error instanceof OutputDirectoryError ||
+    error instanceof ConfigurationError ||
+    error instanceof PluginPythonUnavailableError
+  ) {
+    return true;
+  }
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code: unknown }).code === "string" &&
+    LOCAL_SYSCALL_CODES.has((error as { code: string }).code)
+  );
+}
+
 function scanFailureMessage(
   error: unknown,
   authentication: ScanAuthentication | null,
 ): string {
+  // A local failure keeps its own message. Classification matches bare words
+  // such as "permission denied" anywhere in the text, so an EACCES from a
+  // read-only TMPDIR would otherwise be reported as a credential problem.
+  //
+  // The advice branches below still replace the underlying text rather than
+  // appending it. That is deliberate: upstream authentication and authorization
+  // errors can name the organization or project, which must not reach stderr or
+  // the JSON error field.
+  if (isLocalScanFailure(error)) return redactedErrorMessage(error);
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
       return authentication?.method === "api_key"
@@ -2716,7 +2962,7 @@ function scanFailureMessage(
     case "network_error":
     case "timeout":
     case "unknown":
-      return cliErrorMessage(error);
+      return redactedErrorMessage(error);
   }
 }
 
@@ -2730,7 +2976,9 @@ function scanScope(arguments_: ScanArguments): string | null {
         portable.startsWith("//")
           ? portable.split("/").at(-1) ?? portable
           : portable;
-      return cliErrorMessage(scoped.replaceAll(/[\u0000-\u001F\u007F]/gu, " "));
+      return redactedErrorMessage(
+        scoped.replaceAll(/[\u0000-\u001F\u007F]/gu, " "),
+      );
     });
     return `${displayed.join(", ")}${arguments_.paths.length > displayed.length ? `, +${arguments_.paths.length - displayed.length} more` : ""}`;
   }
@@ -2752,7 +3000,10 @@ function printScanSummary(
   result: ScanResult,
   progress: Progress | null,
   errorOutput: Writable,
+  color: boolean,
 ): void {
+  const paint = (value: string, code: number | string): string =>
+    color ? `\u001B[${code}m${value}\u001B[0m` : value;
   const severities = new Map<SeverityLevel, number>();
   for (const finding of result.findings.findings) {
     severities.set(
@@ -2766,9 +3017,6 @@ function printScanSummary(
   })
     .filter((value): value is string => value !== null)
     .join(", ");
-  errorOutput.write(
-    `codex-security: Findings: ${result.findings.findings.length}${severitySummary === "" ? "" : ` (${severitySummary})`}. Coverage: ${result.coverage.completeness}.\n`,
-  );
 
   const started = Date.parse(result.manifest.scan.startedAt);
   const completed = Date.parse(result.manifest.scan.completedAt);
@@ -2778,22 +3026,37 @@ function printScanSummary(
     completed >= started
       ? Math.floor((completed - started) / 1_000)
       : progress?.elapsedSeconds ?? 0;
-  errorOutput.write(`codex-security: Elapsed: ${elapsed}s.\n`);
+  const duration =
+    elapsed < 60
+      ? `${elapsed}s`
+      : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+  const findingCount = result.findings.findings.length;
+  const findingColor =
+    findingCount === 0
+      ? 32
+      : severities.has("critical") || severities.has("high")
+        ? 31
+        : severities.has("medium")
+          ? 33
+          : 36;
+  errorOutput.write(
+    `\n  ${paint("REPORT", "1;36")}    ${paint(redactedErrorMessage(result.reportPath), 4)}\n\n` +
+      `  ${paint("FINDINGS", 1)}  ${paint(`${findingCount}${severitySummary === "" ? "" : ` (${severitySummary})`}`, findingColor)}\n` +
+      `  ${paint("COVERAGE", 1)}  ${result.coverage.completeness}\n` +
+      `  ${paint("ELAPSED", 1)}   ${duration}\n`,
+  );
 
   const tokenSummary = formatTokenUsage(result.turnResult.usage);
   if (tokenSummary !== null) {
-    errorOutput.write(`codex-security: Tokens: ${tokenSummary}.\n`);
+    errorOutput.write(`  ${paint("TOKENS", 1)}    ${tokenSummary}\n`);
   }
   if (result.cost !== null) {
     errorOutput.write(
-      `codex-security: Estimated cost: ${formatUsd(result.cost.estimatedUsd)} USD.\n`,
+      `  ${paint("COST", 1)}      ${formatUsd(result.cost.estimatedUsd)}\n`,
     );
   }
   errorOutput.write(
-    `codex-security: Report: ${cliErrorMessage(result.reportPath)}\n`,
-  );
-  errorOutput.write(
-    `codex-security: Results: ${cliErrorMessage(result.scanDir)}\n`,
+    `  ${paint("RESULTS", 1)}   ${redactedErrorMessage(result.scanDir)}\n`,
   );
 }
 
@@ -2844,7 +3107,7 @@ function protectedRootErrorMessage(
         ? "Set TMPDIR (or TEMP on Windows) to a writable directory outside the protected root."
         : `Set TMPDIR (or TEMP on Windows) to ${quoteCliPath(suggestion)} after creating that directory.`;
   return [
-    `codex-security: ${description} must be outside the scanned directory and any enclosing Git worktree.`,
+    `${description} must be outside the scanned directory and any enclosing Git worktree.`,
     `  Resolved path:  ${error.outputDirectory}`,
     `  Protected root: ${error.protectedRoot}`,
     `  Reason:         ${reason}`,
@@ -3103,7 +3366,7 @@ function interruptedExit(
   errorOutput.write(
     scanDir === null
       ? "codex-security: No partial output was kept.\n"
-      : `codex-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+      : `codex-security: Partial output was kept at ${redactedErrorMessage(scanDir)}.\n`,
   );
   return ctrlC ? 130 : 143;
 }
@@ -3123,34 +3386,13 @@ function invokedAsMain(): boolean {
   }
 }
 
-function cliErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message
-    .replaceAll(
-      /(\b[A-Za-z0-9_-]{0,64}(?:api[_-]?key|access[_-]?key(?:[_-]?id)?|token|secret|credential|signature|sig|password|passwd)\b(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^\s"',;}&\\\]]+/giu,
-      "$1[redacted]",
-    )
-    .replaceAll(/sk-(?:proj-)?[A-Za-z0-9_*=-]{8,}/gu, "[redacted]")
-    .replaceAll(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_-]{8,}/giu, "[redacted]")
-    .replaceAll(/npm_[A-Za-z0-9_-]{8,}/giu, "[redacted]")
-    .replaceAll(
-      /(^|%20|[^A-Za-z0-9_])(Bearer|Basic|Token)((?:\s|%20|\+)+)[A-Za-z0-9.%_~+/*=-]{8,}/giu,
-      "$1$2$3[redacted]",
-    )
-    .replaceAll(/((?:https?|ssh|git\+ssh):\/\/)[^\s/@]+@/giu, "$1[redacted]@")
-    .replaceAll(
-      /((?:[?&]|%3F|%26)(?:(?!%3F|%26|%3D)(?:[A-Za-z0-9_.%-]|\[|\])){0,64}(?:api[_-]?key|access(?:[_-]|%5F|%2D)?key(?:(?:[_-]|%5F|%2D)?id)?|token|secret|credential|signature|sig|password|passwd)(?:\]|%5D)?(?:=|%3D))(?:(?!%26)[^&\s])+/giu,
-      "$1[redacted]",
-    );
-}
-
 if (invokedAsMain()) {
   void main().then(
     (exitCode) => {
       process.exitCode = exitCode;
     },
     (error: unknown) => {
-      process.stderr.write(`codex-security: ${cliErrorMessage(error)}\n`);
+      process.stderr.write(`codex-security: ${redactedErrorMessage(error)}\n`);
       process.exitCode = 2;
     },
   );

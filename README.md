@@ -8,13 +8,15 @@
 
 ## Quick start
 
-Requires Node.js 22 or later, Python 3.10 or later, and access to Codex Security.
+Requires Node.js 22.13.0 or later in the 22.x release line, Node.js 24.x, or
+Node.js 26.x; Python 3.10 or later; and access to Codex Security.
 
 ```bash
 npm install @openai/codex-security
 npx @openai/codex-security login
 npx @openai/codex-security scan .
 npx @openai/codex-security scan . --model gpt-5.6-terra --effort high
+npx @openai/codex-security scan . --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10
 ```
 
 For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in. Environment API keys are
@@ -45,6 +47,11 @@ Scan history is stored in the Codex Security workbench state directory. If that
 directory cannot be written, set `CODEX_SECURITY_STATE_DIR` to a writable
 directory outside the repository.
 
+`scans compare BEFORE_SCAN_ID AFTER_SCAN_ID` automatically matches findings by
+root cause, reuses saved matches, and identifies new, persisting, reopened,
+resolved, or unknown findings. Missing findings remain unknown when coverage is
+incomplete or their original location was not reviewed.
+
 ## TypeScript SDK
 
 ```ts
@@ -52,10 +59,28 @@ import { CodexSecurity } from "@openai/codex-security";
 
 const security = new CodexSecurity();
 const result = await security.run(".");
+await security.run(".", {
+  mode: "deep",
+  workers: 2,
+  subagents: 0,
+  stopAfterNoNew: 3,
+  maxDiscoveryRuns: 10,
+});
 
 console.log(result.reportPath);
 await security.close();
 ```
+
+## Containerized bulk scans
+
+Use the official image and included Docker Compose configuration for
+noninteractive, resumable scans of repositories pinned to immutable Git
+revisions. See the [container quick start](sdk/typescript/README.md#containerized-bulk-scans)
+for authentication, private result storage, and optional Ubuntu AppArmor
+hardening.
+
+Pass `--knowledge-base PATH` to share security documents with every repository;
+repeat the option for multiple files or directories.
 
 For complete command help, runtime defaults, native multi-agent worker limits,
 environment variables, deep-scan configuration, and SDK options, see the
