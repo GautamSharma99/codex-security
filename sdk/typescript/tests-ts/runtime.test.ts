@@ -7,8 +7,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   realpath,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
@@ -45,14 +47,25 @@ import {
   validateOutputDir,
 } from "../src/index.js";
 import {
+  acquireCodexSecurityCredentialHomeLock,
   bundledPluginCandidates,
+  codexSecurityCredentialAllowsAmbientImport,
+  codexSecurityCredentialHome,
+  codexSecurityHasStoredFileCredentials,
   codexSecurityStateDirectory,
   codexPlatformPackage,
   isPythonPathCandidate,
   planOutputArchive,
+  prepareCodexSecurityCredentialHome,
   preparePersistentScanRoot,
+  requirePrivateCredentialHome,
+  requirePrivateCredentialFile,
   requirePrivateOutputDirectory,
+  requireSecureCredentialHome,
+  requireSecureOutputAncestry,
+  requireTrustedOutputAncestor,
   runWorkbench,
+  setCodexSecurityCredentialLogout,
 } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
@@ -377,6 +390,92 @@ describe("plugin runtime preparation", () => {
         ),
       ),
     ).toBeDefined();
+  });
+
+  test("bounds configured plugin directory discovery", async () => {
+    const overflowRoot = await temporaryDirectory();
+    const overflowSource = await plugin(overflowRoot);
+    const overflowDirectory = join(overflowSource, "many-files");
+    await mkdir(overflowDirectory);
+    for (let offset = 0; offset < 4_096; offset += 128) {
+      await Promise.all(
+        Array.from({ length: 128 }, (_value, index) =>
+          writeFile(join(overflowDirectory, String(offset + index)), ""),
+        ),
+      );
+    }
+    const overflowDestination = join(overflowRoot, "overflow-home");
+    await expect(
+      createMarketplace(overflowDestination, overflowSource),
+    ).rejects.toThrow("copy entry limit");
+    expect(
+      existsSync(
+        join(
+          overflowDestination,
+          "sdk-marketplace",
+          "plugins",
+          "codex-security",
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  test("cancels configured plugin directory discovery", async () => {
+    const cancellationRoot = await temporaryDirectory();
+    const cancellationSource = await plugin(cancellationRoot);
+    const cancellationDirectory = join(cancellationSource, "many-files");
+    await mkdir(cancellationDirectory);
+    await Promise.all(
+      Array.from({ length: 32 }, (_value, index) =>
+        writeFile(join(cancellationDirectory, String(index)), ""),
+      ),
+    );
+    const cancellationDestination = join(cancellationRoot, "canceled-home");
+    const controller = new AbortController();
+    const originalOpendir = fsPromises.opendir;
+    let discovered = 0;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      opendir: async (...args: Parameters<typeof originalOpendir>) => {
+        const directory = await originalOpendir(...args);
+        if (String(args[0]) !== cancellationDirectory) return directory;
+        const originalRead = directory.read.bind(directory);
+        directory.read = async () => {
+          const entry = await originalRead();
+          discovered += 1;
+          if (discovered === 2) {
+            controller.abort(new DOMException("canceled", "AbortError"));
+          }
+          return entry;
+        };
+        return directory;
+      },
+    }));
+    try {
+      await expect(
+        createMarketplace(
+          cancellationDestination,
+          cancellationSource,
+          controller.signal,
+        ),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(discovered).toBe(2);
+      expect(
+        existsSync(
+          join(
+            cancellationDestination,
+            "sdk-marketplace",
+            "plugins",
+            "codex-security",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        opendir: originalOpendir,
+      }));
+    }
   });
 
   testPosix(
@@ -732,6 +831,79 @@ describe("plugin runtime preparation", () => {
     }
   });
 
+  test("imports ambient auth when credential files do not support hard links", async () => {
+    const root = await temporaryDirectory();
+    const ambient = join(root, "ambient");
+    const isolated = join(root, "isolated");
+    await mkdir(ambient);
+    await writeFile(join(ambient, "auth.json"), '{"token":"portable"}\n');
+    const originalLink = fsPromises.link;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      link: async () => {
+        const error = new Error(
+          "hard links are unsupported",
+        ) as NodeJS.ErrnoException;
+        error.code = "ENOTSUP";
+        throw error;
+      },
+    }));
+    try {
+      expect(await importAmbientAuth(ambient, isolated)).toBe(true);
+      expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
+        '{"token":"portable"}\n',
+      );
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: originalLink,
+      }));
+    }
+  });
+
+  test("never replaces an explicitly stored sign-in with ambient credentials", async () => {
+    const root = await temporaryDirectory();
+    const ambient = join(root, "ambient");
+    const isolated = join(root, "isolated");
+    await mkdir(ambient);
+    await mkdir(isolated, { mode: 0o700 });
+    if (process.platform !== "win32") await chmod(isolated, 0o700);
+    await writeFile(join(ambient, "auth.json"), '{"token":"ambient"}\n');
+    await writeFile(join(isolated, "auth.json"), '{"token":"explicit"}\n', {
+      mode: 0o600,
+    });
+    if (process.platform !== "win32") {
+      await chmod(join(isolated, "auth.json"), 0o600);
+    }
+
+    expect(await importAmbientAuth(ambient, isolated)).toBe(true);
+    expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
+      '{"token":"explicit"}\n',
+    );
+  });
+
+  test("uses unique temporary files for parallel ambient credential imports", async () => {
+    const root = await temporaryDirectory();
+    const ambient = join(root, "ambient");
+    const isolated = join(root, "isolated");
+    await mkdir(ambient);
+    await writeFile(join(ambient, "auth.json"), '{"token":"ambient"}\n');
+
+    const imports = await Promise.all(
+      Array.from({ length: 8 }, async () =>
+        importAmbientAuth(ambient, isolated),
+      ),
+    );
+
+    expect(imports).toEqual(Array.from({ length: 8 }, () => true));
+    expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
+      '{"token":"ambient"}\n',
+    );
+    expect(
+      (await readdir(isolated)).filter((path) => path.startsWith(".auth-")),
+    ).toEqual([]);
+  });
+
   test.skipIf(process.platform === "win32")(
     "imports symlink-backed ambient auth",
     async () => {
@@ -803,6 +975,319 @@ describe("plugin runtime preparation", () => {
     ]);
     expect(install.installedRoot).toBe(installed);
     expect(install.version).toBe("1.2.3");
+
+    const reused = await bootstrapPlugin(home, selected, {
+      codexCommand: { command: "/codex", prefixArgs: [] },
+      runCodex: async () => {
+        throw new Error("must not reinstall an existing Codex Security plugin");
+      },
+    });
+    expect(reused.installedRoot).toBe(installed);
+    expect(reused.version).toBe("1.2.3");
+    expect(calls).toHaveLength(2);
+  });
+
+  test("repairs an interrupted marketplace without deleting stored credentials", async () => {
+    const root = await temporaryDirectory();
+    const selected = await plugin(root);
+    const home = join(root, "home");
+    const marketplace = join(home, "sdk-marketplace");
+    const installed = join(
+      home,
+      "plugins",
+      "cache",
+      "codex-security-sdk",
+      "codex-security",
+      "1.2.3",
+    );
+    await mkdir(join(marketplace, ".agents", "plugins"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(marketplace, ".agents", "plugins", "marketplace.json"),
+      "interrupted installation\n",
+    );
+    await writeFile(join(home, "config.toml"), "[features]\nplugins = true\n");
+    await writeFile(join(home, "auth.json"), '{"token":"preserved"}\n');
+    const calls: string[][] = [];
+
+    const result = await bootstrapPlugin(home, selected, {
+      codexCommand: { command: "/codex", prefixArgs: [] },
+      runCodex: async (_command, args) => {
+        calls.push([...args]);
+        if (args[1] === "marketplace") {
+          await writeFile(
+            join(home, "config.toml"),
+            `\n[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
+            { flag: "a" },
+          );
+        } else {
+          await writeFile(
+            join(home, "config.toml"),
+            '\n[plugins."codex-security@codex-security-sdk"]\nenabled = true\n',
+            { flag: "a" },
+          );
+          await mkdir(join(installed, ".codex-plugin"), { recursive: true });
+          await writeFile(
+            join(installed, ".codex-plugin", "plugin.json"),
+            JSON.stringify({ name: "codex-security", version: "1.2.3" }),
+          );
+        }
+        return "";
+      },
+    });
+
+    expect(result.installedRoot).toBe(installed);
+    expect(await readFile(join(home, "auth.json"), "utf8")).toBe(
+      '{"token":"preserved"}\n',
+    );
+    expect(calls).toEqual([
+      ["plugin", "marketplace", "add", marketplace],
+      ["plugin", "add", "codex-security@codex-security-sdk"],
+    ]);
+  });
+
+  test("reinstalls changed plugin contents even when the version is unchanged", async () => {
+    const root = await temporaryDirectory();
+    const previous = await plugin(join(root, "previous"), "1.2.3");
+    const next = await plugin(join(root, "next"), "1.2.3");
+    await writeFile(join(next, "scripts", "helper.py"), "print('updated')\n");
+    const home = join(root, "home");
+    const marketplace = join(home, "sdk-marketplace");
+    const cache = join(
+      home,
+      "plugins",
+      "cache",
+      "codex-security-sdk",
+      "codex-security",
+    );
+    await mkdir(home);
+    let marketplaceRegistered = false;
+    let pluginRegistered = false;
+    const updateConfig = async () => {
+      const sections = ["[features]\nplugins = true\n"];
+      if (marketplaceRegistered) {
+        sections.push(
+          `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
+        );
+      }
+      if (pluginRegistered) {
+        sections.push(
+          '[plugins."codex-security@codex-security-sdk"]\nenabled = true\n',
+        );
+      }
+      await writeFile(join(home, "config.toml"), sections.join("\n"));
+    };
+    await updateConfig();
+    const calls: string[][] = [];
+    const options = {
+      codexCommand: { command: "/codex", prefixArgs: [] },
+      runCodex: async (
+        _command: { command: string; prefixArgs: readonly string[] },
+        args: readonly string[],
+      ) => {
+        calls.push([...args]);
+        if (args[1] === "marketplace" && args[2] === "add") {
+          marketplaceRegistered = true;
+        } else if (args[1] === "marketplace" && args[2] === "remove") {
+          marketplaceRegistered = false;
+        } else if (args[1] === "remove") {
+          pluginRegistered = false;
+          await rm(cache, { recursive: true, force: true });
+        } else if (args[1] === "add") {
+          const installed = join(cache, "1.2.3");
+          await mkdir(join(installed, ".codex-plugin"), { recursive: true });
+          await writeFile(
+            join(installed, ".codex-plugin", "plugin.json"),
+            JSON.stringify({ name: "codex-security", version: "1.2.3" }),
+          );
+          pluginRegistered = true;
+        } else {
+          throw new Error(`Unexpected plugin command: ${args.join(" ")}`);
+        }
+        await updateConfig();
+        return "";
+      },
+    };
+
+    await bootstrapPlugin(home, previous, options);
+    const result = await bootstrapPlugin(home, next, options);
+
+    expect(result.pluginRoot).toBe(next);
+    expect(
+      await readFile(
+        join(marketplace, "plugins", "codex-security", "scripts", "helper.py"),
+        "utf8",
+      ),
+    ).toBe("print('updated')\n");
+    expect(calls).toEqual([
+      ["plugin", "marketplace", "add", marketplace],
+      ["plugin", "add", "codex-security@codex-security-sdk"],
+      ["plugin", "remove", "codex-security@codex-security-sdk"],
+      ["plugin", "marketplace", "remove", "codex-security-sdk"],
+      ["plugin", "marketplace", "add", marketplace],
+      ["plugin", "add", "codex-security@codex-security-sdk"],
+    ]);
+  });
+
+  test("upgrades a cached plugin without deleting persistent credentials", async () => {
+    const root = await temporaryDirectory();
+    const previous = await plugin(join(root, "previous"), "1.2.3");
+    const next = await plugin(join(root, "next"), "1.2.4");
+    const home = join(root, "home");
+    const configPath = join(home, "config.toml");
+    const marketplace = join(home, "sdk-marketplace");
+    const pluginCache = join(
+      home,
+      "plugins",
+      "cache",
+      "codex-security-sdk",
+      "codex-security",
+    );
+    await mkdir(home);
+    await writeFile(join(home, "auth.json"), '{"token":"preserved"}\n');
+    await writeFile(join(home, "unrelated-state"), "preserved\n");
+
+    let marketplaceRegistered = false;
+    let pluginRegistered = false;
+    const updateConfig = async () => {
+      const sections = [
+        "[features]\nplugins = true\n",
+        `[projects.${JSON.stringify(join(root, "unrelated-project"))}]\ntrust_level = "trusted"\n`,
+      ];
+      if (marketplaceRegistered) {
+        sections.push(
+          `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`,
+        );
+      }
+      if (pluginRegistered) {
+        sections.push(
+          '[plugins."codex-security@codex-security-sdk"]\nenabled = true\n',
+        );
+      }
+      await writeFile(configPath, sections.join("\n"));
+    };
+    await updateConfig();
+
+    const calls: string[][] = [];
+    const runCodex: NonNullable<
+      NonNullable<Parameters<typeof bootstrapPlugin>[2]>["runCodex"]
+    > = async (_command, args, environment) => {
+      expect(environment["CODEX_HOME"]).toBe(home);
+      calls.push([...args]);
+
+      if (args[1] === "marketplace" && args[2] === "add") {
+        marketplaceRegistered = true;
+      } else if (args[1] === "marketplace" && args[2] === "remove") {
+        marketplaceRegistered = false;
+      } else if (args[1] === "remove") {
+        pluginRegistered = false;
+        await rm(pluginCache, { recursive: true, force: true });
+      } else if (args[1] === "add") {
+        const manifest = JSON.parse(
+          await readFile(
+            join(
+              marketplace,
+              "plugins",
+              "codex-security",
+              ".codex-plugin",
+              "plugin.json",
+            ),
+            "utf8",
+          ),
+        ) as { version: string };
+        const installed = join(pluginCache, manifest.version);
+        await mkdir(join(installed, ".codex-plugin"), { recursive: true });
+        await writeFile(
+          join(installed, ".codex-plugin", "plugin.json"),
+          JSON.stringify({ name: "codex-security", version: manifest.version }),
+        );
+        pluginRegistered = true;
+      } else {
+        throw new Error(`Unexpected plugin command: ${args.join(" ")}`);
+      }
+
+      await updateConfig();
+      return "";
+    };
+    const options = {
+      codexCommand: { command: "/codex", prefixArgs: [] },
+      runCodex,
+    };
+
+    expect((await bootstrapPlugin(home, previous, options)).version).toBe(
+      "1.2.3",
+    );
+    const upgraded = await bootstrapPlugin(home, next, options);
+
+    expect(upgraded.version).toBe("1.2.4");
+    expect(upgraded.installedRoot).toBe(join(pluginCache, "1.2.4"));
+    expect(await readFile(join(home, "auth.json"), "utf8")).toBe(
+      '{"token":"preserved"}\n',
+    );
+    expect(await readFile(join(home, "unrelated-state"), "utf8")).toBe(
+      "preserved\n",
+    );
+    expect(await readFile(configPath, "utf8")).toContain(
+      `[projects.${JSON.stringify(join(root, "unrelated-project"))}]`,
+    );
+    expect(existsSync(join(pluginCache, "1.2.3"))).toBe(false);
+    expect(calls).toEqual([
+      ["plugin", "marketplace", "add", marketplace],
+      ["plugin", "add", "codex-security@codex-security-sdk"],
+      ["plugin", "remove", "codex-security@codex-security-sdk"],
+      ["plugin", "marketplace", "remove", "codex-security-sdk"],
+      ["plugin", "marketplace", "add", marketplace],
+      ["plugin", "add", "codex-security@codex-security-sdk"],
+    ]);
+  });
+
+  test("upgrades a plugin with the real bundled Codex executable", async () => {
+    const root = await temporaryDirectory();
+    const previous = await plugin(join(root, "previous"), "1.2.3");
+    const next = await plugin(join(root, "next"), "1.2.4");
+    const home = join(root, "home");
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(
+      join(home, "config.toml"),
+      'cli_auth_credentials_store = "file"\n\n[features]\nplugins = true\n',
+    );
+
+    const command = resolveCodexCommand();
+    const environment = {
+      ...process.env,
+      CODEX_HOME: home,
+      OPENAI_API_KEY: undefined,
+      CODEX_API_KEY: undefined,
+    };
+    const login = spawnSync(
+      command.command,
+      [...command.prefixArgs, "login", "--with-api-key"],
+      {
+        env: environment,
+        input: "synthetic-key\n",
+        encoding: "utf8",
+        windowsHide: true,
+      },
+    );
+    expect(login.status).toBe(0);
+    const credentials = await readFile(join(home, "auth.json"), "utf8");
+
+    const options = { codexCommand: command, environment };
+    expect((await bootstrapPlugin(home, previous, options)).version).toBe(
+      "1.2.3",
+    );
+    const upgraded = await bootstrapPlugin(home, next, options);
+
+    expect(upgraded.version).toBe("1.2.4");
+    expect(await readFile(join(home, "auth.json"), "utf8")).toBe(credentials);
+    expect(
+      spawnSync(command.command, [...command.prefixArgs, "login", "status"], {
+        env: environment,
+        encoding: "utf8",
+        windowsHide: true,
+      }).status,
+    ).toBe(0);
   });
 
   test("resolves the exact npm Codex executable", () => {
@@ -828,6 +1313,433 @@ describe("plugin runtime preparation", () => {
 });
 
 describe("runtime directories and plugin Python boundary", () => {
+  test("prepares one private, reusable managed-credential home", async () => {
+    const root = await temporaryDirectory();
+    const environment = { CODEX_SECURITY_STATE_DIR: join(root, "state") };
+    const expectedHome = join(root, "state", "codex-home");
+
+    expect(codexSecurityCredentialHome(environment)).toBe(expectedHome);
+    expect(await prepareCodexSecurityCredentialHome(environment)).toBe(
+      expectedHome,
+    );
+    await writeFile(join(expectedHome, "existing-state"), "preserved\n");
+    expect(await prepareCodexSecurityCredentialHome(environment)).toBe(
+      expectedHome,
+    );
+    expect(await readFile(join(expectedHome, "existing-state"), "utf8")).toBe(
+      "preserved\n",
+    );
+    if (process.platform !== "win32") {
+      expect((await stat(expectedHome)).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  testPosix("rejects unsafe persistent credential homes", async () => {
+    const root = await temporaryDirectory();
+    const stateDirectory = join(root, "state");
+    const environment = { CODEX_SECURITY_STATE_DIR: stateDirectory };
+    const credentialHome =
+      await prepareCodexSecurityCredentialHome(environment);
+    await chmod(credentialHome, 0o755);
+    await expect(
+      prepareCodexSecurityCredentialHome(environment),
+    ).rejects.toThrow("must not be accessible to other users");
+    await chmod(credentialHome, 0o700);
+    await rm(credentialHome, { recursive: true, force: true });
+
+    const redirectedHome = join(root, "redirected-home");
+    await mkdir(redirectedHome, { mode: 0o700 });
+    await symlink(redirectedHome, credentialHome);
+    await expect(
+      prepareCodexSecurityCredentialHome(environment),
+    ).rejects.toThrow("credential home is not a directory");
+  });
+
+  testPosix(
+    "rejects credential homes under a non-sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o777 });
+      await chmod(shared, 0o777);
+      expect((await lstat(shared)).mode & 0o1000).toBe(0);
+      const environment = { CODEX_SECURITY_STATE_DIR: join(shared, "state") };
+
+      await expect(
+        prepareCodexSecurityCredentialHome(environment),
+      ).rejects.toThrow("sticky bit");
+      await expect(
+        requireSecureOutputAncestry(join(shared, "state")),
+      ).rejects.toThrow("sticky bit");
+    },
+  );
+
+  testPosix(
+    "accepts credential homes under a sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      // Some filesystems (notably user dirs on macOS APFS) ignore sticky on
+      // chmod; fall back to the process temp root when it is already sticky.
+      let stickyParent = join(root, "shared");
+      await mkdir(stickyParent, { mode: 0o1777 });
+      await chmod(stickyParent, 0o1777);
+      if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+        stickyParent = await realpath(tmpdir());
+        if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+          return;
+        }
+      }
+      const stateDirectory = join(
+        stickyParent,
+        `codex-security-sticky-${process.pid}-${Date.now()}`,
+      );
+      temporaryDirectories.push(stateDirectory);
+      await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: stateDirectory,
+      });
+      await expect(requireSecureCredentialHome(home)).resolves.toBeDefined();
+      await expect(requireSecureOutputAncestry(home)).resolves.toBeUndefined();
+    },
+  );
+
+  testPosix("rejects sticky shared parents controlled by another user", () => {
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o40755, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1000 },
+        "/shared",
+        1000,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      requireTrustedOutputAncestor({ mode: 0o41777, uid: 0 }, "/tmp", 1000),
+    ).not.toThrow();
+  });
+
+  testPosix(
+    "rejects a credential home that is no longer private to the current user",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      await chmod(home, 0o755);
+      await expect(requireSecureCredentialHome(home)).rejects.toThrow(
+        "must not be accessible to other users",
+      );
+      await expect(
+        acquireCodexSecurityCredentialHomeLock(home),
+      ).rejects.toThrow("must not be accessible to other users");
+    },
+  );
+
+  testPosix(
+    "pins credential-home identity for the duration of a lock session",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const release = await acquireCodexSecurityCredentialHomeLock(home);
+      const stolen = join(root, "stolen-home");
+      await rename(home, stolen);
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await chmod(home, 0o700);
+      await expect(release()).rejects.toThrow("credential home was replaced");
+    },
+  );
+
+  testPosix(
+    "rejects stale credential-home metadata after canonical target replacement",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const stale = await lstat(home);
+      await rename(home, join(root, "original-home"));
+      await mkdir(home, { mode: 0o700 });
+
+      await expect(
+        requireSecureCredentialHome(home, { metadata: stale }),
+      ).rejects.toThrow("credential home was replaced");
+    },
+  );
+
+  testPosix(
+    "rejects world-writable or symlink stored authentication files",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const authPath = join(home, "auth.json");
+      await writeFile(authPath, '{"token":"test"}\n', { mode: 0o600 });
+      expect(await codexSecurityHasStoredFileCredentials(home)).toBe(true);
+
+      await chmod(authPath, 0o644);
+      await expect(codexSecurityHasStoredFileCredentials(home)).rejects.toThrow(
+        "must not be accessible to other users",
+      );
+      await rm(authPath);
+
+      const target = join(home, "auth-target.json");
+      await writeFile(target, '{"token":"test"}\n', { mode: 0o600 });
+      await symlink(target, authPath);
+      await expect(codexSecurityHasStoredFileCredentials(home)).rejects.toThrow(
+        "not a regular file",
+      );
+
+      expect(() =>
+        requirePrivateCredentialFile(
+          { mode: 0o100644, uid: 1000 },
+          authPath,
+          1000,
+        ),
+      ).toThrow("must not be accessible to other users");
+    },
+  );
+
+  test("identifies a credential home that already exists as a regular file", async () => {
+    const root = await temporaryDirectory();
+    const stateDirectory = join(root, "state");
+    await mkdir(stateDirectory);
+    await writeFile(join(stateDirectory, "codex-home"), "not a directory\n");
+
+    await expect(
+      prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: stateDirectory,
+      }),
+    ).rejects.toThrow("credential home is not a directory");
+  });
+
+  test("serializes and releases persistent credential-home locks", async () => {
+    const root = await temporaryDirectory();
+    const home = await prepareCodexSecurityCredentialHome({
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+    });
+    const releaseFirst = await acquireCodexSecurityCredentialHomeLock(home);
+    let secondAcquired = false;
+    const second = acquireCodexSecurityCredentialHomeLock(home).then(
+      (release) => {
+        secondAcquired = true;
+        return release;
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(secondAcquired).toBe(false);
+    await releaseFirst();
+    const releaseSecond = await second;
+    expect(secondAcquired).toBe(true);
+    await releaseSecond();
+    expect(existsSync(join(home, ".codex-security-scan.lock"))).toBe(false);
+  });
+
+  test("cancels a scan waiting for the persistent credential-home lock", async () => {
+    const root = await temporaryDirectory();
+    const home = await prepareCodexSecurityCredentialHome({
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+    });
+    const release = await acquireCodexSecurityCredentialHomeLock(home);
+    const controller = new AbortController();
+    const waiting = acquireCodexSecurityCredentialHomeLock(
+      home,
+      controller.signal,
+    );
+    controller.abort(new DOMException("canceled", "AbortError"));
+
+    try {
+      await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      await release();
+    }
+  });
+
+  test("does not rewrite Windows credential ACLs while polling a held lock", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "credential-home");
+    await mkdir(home, { mode: 0o700 });
+    const validations: string[] = [];
+    const securityOptions = {
+      platform: "win32" as const,
+      secureWindowsHome: async (path: string) => {
+        const lock = join(path, ".codex-security-scan.lock");
+        expect(existsSync(lock) && !existsSync(join(lock, "owner.json"))).toBe(
+          false,
+        );
+        validations.push(path);
+      },
+    };
+    const release = await acquireCodexSecurityCredentialHomeLock(
+      home,
+      undefined,
+      securityOptions,
+    );
+    const controller = new AbortController();
+    const waiting = acquireCodexSecurityCredentialHomeLock(
+      home,
+      controller.signal,
+      securityOptions,
+    );
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(validations).toHaveLength(3);
+      controller.abort(new DOMException("canceled", "AbortError"));
+      await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      await release();
+    }
+  });
+
+  test("recovers credential-home locks left by exited processes", async () => {
+    const root = await temporaryDirectory();
+    const home = await prepareCodexSecurityCredentialHome({
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+    });
+    const exited = spawnSync(process.execPath, ["--eval", ""], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    expect(exited.status).toBe(0);
+    expect(typeof exited.pid).toBe("number");
+    const lock = join(home, ".codex-security-scan.lock");
+    await mkdir(lock, { mode: 0o700 });
+    await writeFile(
+      join(lock, "owner.json"),
+      `${JSON.stringify({ pid: exited.pid, token: "exited-process" })}\n`,
+      { mode: 0o600 },
+    );
+
+    const release = await acquireCodexSecurityCredentialHomeLock(home);
+    expect(existsSync(lock)).toBe(true);
+    await release();
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  test("prevents ambient credential imports after an explicit logout", async () => {
+    const root = await temporaryDirectory();
+    const home = await prepareCodexSecurityCredentialHome({
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+    });
+
+    expect(await codexSecurityCredentialAllowsAmbientImport(home)).toBe(true);
+    await setCodexSecurityCredentialLogout(home, true);
+    expect(await codexSecurityCredentialAllowsAmbientImport(home)).toBe(false);
+    if (process.platform !== "win32") {
+      expect(
+        (await stat(join(home, ".codex-security-logged-out"))).mode & 0o777,
+      ).toBe(0o600);
+    }
+    await setCodexSecurityCredentialLogout(home, false);
+    expect(await codexSecurityCredentialAllowsAmbientImport(home)).toBe(true);
+  });
+
+  test("requires a real private-ACL operation for Windows credential homes", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "home");
+    await mkdir(home);
+    const metadata = await lstat(home);
+    const secured: string[] = [];
+
+    await requirePrivateCredentialHome(metadata, home, {
+      platform: "win32",
+      secureWindowsHome: async (path) => {
+        secured.push(path);
+      },
+    });
+
+    expect(secured).toEqual([home]);
+    await expect(
+      requirePrivateCredentialHome(metadata, home, {
+        platform: "win32",
+        secureWindowsHome: async () => {
+          throw new Error("ACL could not be secured");
+        },
+      }),
+    ).rejects.toThrow("private Windows credential home");
+  });
+
+  test("revalidates the Windows credential ACL every time the home is used", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "home");
+    await mkdir(home);
+    const validations: string[] = [];
+
+    await requireSecureCredentialHome(home, {
+      platform: "win32",
+      secureWindowsHome: async (path) => {
+        validations.push(path);
+      },
+    });
+
+    expect(validations).toEqual([home]);
+    await expect(
+      requireSecureCredentialHome(home, {
+        platform: "win32",
+        secureWindowsHome: async () => {
+          throw new Error("ACL changed after preparation");
+        },
+      }),
+    ).rejects.toThrow("private Windows credential home");
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "creates credential homes with a verified current-user-only Windows ACL",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const powershell = join(
+        process.env["SystemRoot"] ?? "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      );
+      const command = [
+        "$ErrorActionPreference = 'Stop'",
+        "$path = [Environment]::GetEnvironmentVariable('CODEX_SECURITY_TEST_ACL_PATH', 'Process')",
+        "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$acl = [System.IO.Directory]::GetAccessControl($path)",
+        "$unexpected = @($acl.Access | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $identity })",
+        "[pscustomobject]@{ protected = $acl.AreAccessRulesProtected; unexpected = $unexpected.Count } | ConvertTo-Json -Compress",
+      ].join("; ");
+      const result = spawnSync(
+        powershell,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+        {
+          encoding: "utf8",
+          env: { ...process.env, CODEX_SECURITY_TEST_ACL_PATH: home },
+          timeout: 15_000,
+          windowsHide: true,
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        protected: true,
+        unexpected: 0,
+      });
+    },
+  );
+
   test("derives persistent state from the ambient home or explicit override", async () => {
     const root = await temporaryDirectory();
     expect(codexSecurityStateDirectory({ CODEX_HOME: root })).toBe(
@@ -945,6 +1857,517 @@ describe("runtime directories and plugin Python boundary", () => {
       ["test-command"],
     );
     expect(result).toEqual({ ok: true });
+  });
+
+  test("upgrades colliding legacy execution-profile and public CLI migrations", async () => {
+    const root = await temporaryDirectory("codex-security-legacy-migrations-");
+    const repository = join(root, "repository");
+    const stateDirectory = join(root, "state");
+    const scanDirectory = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(stateDirectory);
+    await mkdir(scanDirectory, { mode: 0o700 });
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const fixture = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_schema import MIGRATIONS, sql_statements",
+          "repository = Path(sys.argv[2])",
+          "connection = sqlite3.connect(Path(sys.argv[3]) / 'workbench.sqlite3')",
+          "connection.execute('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')",
+          "timestamp = '2026-07-09T00:00:00Z'",
+          "for version, name, migration in MIGRATIONS:",
+          "    if version > 10: break",
+          "    for statement in sql_statements(migration): connection.execute(statement)",
+          "    connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (version, name, timestamp))",
+          "for table in ('workspaces', 'scans'):",
+          "    connection.execute(f'ALTER TABLE {table} ADD COLUMN execution_model TEXT CHECK (execution_model IS NULL OR length(execution_model) BETWEEN 1 AND 128)')",
+          "    connection.execute(f'ALTER TABLE {table} ADD COLUMN reasoning_effort TEXT CHECK ((reasoning_effort IS NULL OR length(reasoning_effort) BETWEEN 1 AND 64) AND ((execution_model IS NULL) = (reasoning_effort IS NULL)))')",
+          "connection.executemany('INSERT INTO schema_migrations VALUES (?, ?, ?)', [(11, 'scan execution profiles', timestamp), (12, 'dynamic scan execution profiles', timestamp)])",
+          "connection.execute(\"ALTER TABLE scans ADD COLUMN completion_warnings_json TEXT NOT NULL DEFAULT '[]'\")",
+          "connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (25, 'persist scan completion warnings', timestamp))",
+          "connection.execute('INSERT INTO workspaces (id, target_path, thread_id, execution_model, reasoning_effort, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', ('legacy-workspace', str(repository), 'legacy-thread', 'gpt-workspace', 'medium', timestamp, timestamp))",
+          "connection.execute('INSERT INTO scans (id, workspace_id, target_path, target_revision, scope, mode, scan_dir, status, phase, started_at, created_at, updated_at, execution_model, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', ('legacy-scan', 'legacy-workspace', str(repository), 'legacy-revision', '.', 'standard', str(repository / 'legacy-scan'), 'complete', 'reporting', timestamp, timestamp, timestamp, 'gpt-legacy', 'high'))",
+          "connection.execute('UPDATE scans SET completion_warnings_json = ? WHERE id = ?', ('[\"legacy warning\"]', 'legacy-scan'))",
+          "connection.commit()",
+          "connection.close()",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        repository,
+        stateDirectory,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(fixture.status).toBe(0);
+    expect(fixture.stderr).toBe("");
+
+    const registration = await runWorkbench(
+      {
+        python: python!,
+        pluginRoot: PLUGIN_ROOT,
+        environment: {
+          PATH: process.env["PATH"],
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        },
+      },
+      [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        scanDirectory,
+        "--recipe-json",
+        JSON.stringify({
+          config: {},
+          mode: "standard",
+          repository,
+          target: { kind: "repository", paths: [] },
+        }),
+      ],
+    );
+    expect(registration["scanId"]).toBeString();
+
+    const upgraded = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, sqlite3, sys",
+          "connection = sqlite3.connect(sys.argv[1])",
+          "connection.row_factory = sqlite3.Row",
+          "columns = {row['name'] for row in connection.execute('PRAGMA table_info(scans)')}",
+          "migrations = {row['version']: row['name'] for row in connection.execute('SELECT version, name FROM schema_migrations WHERE version IN (11, 12, 25, 26)')}",
+          "profile = connection.execute('SELECT legacy_execution_model, legacy_reasoning_effort, model, reasoning_effort FROM scans WHERE id = ?', ('legacy-scan',)).fetchone()",
+          "workspace_profile = connection.execute('SELECT legacy_execution_model, legacy_reasoning_effort FROM workspaces WHERE id = ?', ('legacy-workspace',)).fetchone()",
+          "warnings = connection.execute('SELECT completion_warnings_json FROM scans WHERE id = ?', ('legacy-scan',)).fetchone()[0]",
+          "connection.execute('UPDATE scans SET model = ?, reasoning_effort = NULL WHERE id = ?', ('gpt-current', sys.argv[2]))",
+          "connection.execute('UPDATE scans SET reasoning_effort = ? WHERE id = ?', ('high', sys.argv[2]))",
+          "current_profile = connection.execute('SELECT legacy_execution_model, legacy_reasoning_effort, model, reasoning_effort FROM scans WHERE id = ?', (sys.argv[2],)).fetchone()",
+          "deep_scan_tables = connection.execute(\"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deep_scan_runs'\").fetchone()",
+          "print(json.dumps({'columns': sorted(columns & {'deep_scan_owner_thread_id', 'continuation_thread_id', 'model', 'reasoning_effort', 'completion_warnings_json', 'legacy_execution_model', 'legacy_reasoning_effort'}), 'migrations': migrations, 'profile': dict(profile), 'workspaceProfile': dict(workspace_profile), 'warnings': json.loads(warnings), 'currentProfile': dict(current_profile), 'deepScanTables': deep_scan_tables is not None}))",
+        ].join("\n"),
+        join(stateDirectory, "workbench.sqlite3"),
+        String(registration["scanId"]),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(upgraded.status).toBe(0);
+    expect(upgraded.stderr).toBe("");
+    expect(JSON.parse(upgraded.stdout)).toEqual({
+      columns: [
+        "completion_warnings_json",
+        "continuation_thread_id",
+        "deep_scan_owner_thread_id",
+        "legacy_execution_model",
+        "legacy_reasoning_effort",
+        "model",
+        "reasoning_effort",
+      ],
+      migrations: {
+        "11": "deep scan orchestration state",
+        "12": "scan continuation threads",
+        "25": "persist scan model settings",
+        "26": "persist scan completion warnings",
+      },
+      profile: {
+        legacy_execution_model: "gpt-legacy",
+        legacy_reasoning_effort: "high",
+        model: "gpt-legacy",
+        reasoning_effort: "high",
+      },
+      workspaceProfile: {
+        legacy_execution_model: "gpt-workspace",
+        legacy_reasoning_effort: "medium",
+      },
+      warnings: ["legacy warning"],
+      currentProfile: {
+        legacy_execution_model: null,
+        legacy_reasoning_effort: null,
+        model: "gpt-current",
+        reasoning_effort: "high",
+      },
+      deepScanTables: true,
+    });
+  });
+
+  test.each([
+    [
+      "released continuation v12",
+      "scan execution profiles",
+      "scan continuation threads",
+      true,
+    ],
+    [
+      "historical phase-progress v12",
+      "scan execution profiles",
+      "phase-specific scan progress",
+      true,
+    ],
+    [
+      "unknown v11 plus released continuation v12",
+      "unknown execution profile migration",
+      "scan continuation threads",
+      false,
+    ],
+  ] as const)(
+    "reconciles %s without corrupting migration history",
+    async (_history, profileMigration, followUpMigration, supportedHistory) => {
+      const root = await temporaryDirectory(
+        "codex-security-migration-history-",
+      );
+      const stateDirectory = join(root, "state");
+      await mkdir(stateDirectory);
+      const database = join(stateDirectory, "workbench.sqlite3");
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+
+      const fixture = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sqlite3, sys",
+            "sys.path.insert(0, sys.argv[1])",
+            "from workbench_schema import MIGRATIONS, sql_statements",
+            "connection = sqlite3.connect(sys.argv[2])",
+            "connection.execute('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')",
+            "timestamp = '2026-07-30T00:00:00Z'",
+            "for version, name, migration in MIGRATIONS:",
+            "    if version > 10: break",
+            "    for statement in sql_statements(migration): connection.execute(statement)",
+            "    connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (version, name, timestamp))",
+            "for table in ('workspaces', 'scans'):",
+            "    connection.execute(f'ALTER TABLE {table} ADD COLUMN execution_model TEXT')",
+            "    connection.execute(f'ALTER TABLE {table} ADD COLUMN reasoning_effort TEXT')",
+            "follow_up = next(item for item in MIGRATIONS if item[1] == sys.argv[4])",
+            "for statement in sql_statements(follow_up[2]): connection.execute(statement)",
+            "connection.executemany('INSERT INTO schema_migrations VALUES (?, ?, ?)', [(11, sys.argv[3], timestamp), (12, sys.argv[4], timestamp)])",
+            "connection.execute(\"ALTER TABLE scans ADD COLUMN completion_warnings_json TEXT NOT NULL DEFAULT '[]'\")",
+            "connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (25, 'persist scan completion warnings', timestamp))",
+            "connection.commit()",
+            "connection.close()",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          database,
+          profileMigration,
+          followUpMigration,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(fixture.status).toBe(0);
+      expect(fixture.stderr).toBe("");
+
+      const upgrade = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+          "database-info",
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+      expect(upgrade.status).toBe(supportedHistory ? 0 : 1);
+      if (!supportedHistory) {
+        expect(upgrade.stderr).toContain(
+          "unsupported execution-profile migration history",
+        );
+      }
+
+      const inspected = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import json, sqlite3, sys",
+            "connection = sqlite3.connect(sys.argv[1])",
+            "connection.row_factory = sqlite3.Row",
+            "migrations = {row['version']: row['name'] for row in connection.execute('SELECT version, name FROM schema_migrations WHERE version IN (11, 12, 20, 25, 26)')}",
+            "columns = {row['name'] for row in connection.execute('PRAGMA table_info(scans)')}",
+            "deep_scan_tables = connection.execute(\"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deep_scan_runs'\").fetchone()",
+            "print(json.dumps({'migrations': migrations, 'legacyColumnsRenamed': 'legacy_execution_model' in columns, 'deepScanTables': deep_scan_tables is not None}))",
+          ].join("\n"),
+          database,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(inspected.status).toBe(0);
+      expect(inspected.stderr).toBe("");
+      if (!supportedHistory) {
+        expect(JSON.parse(inspected.stdout)).toEqual({
+          migrations: {
+            "11": "unknown execution profile migration",
+            "12": "scan continuation threads",
+            "25": "persist scan completion warnings",
+          },
+          legacyColumnsRenamed: false,
+          deepScanTables: false,
+        });
+        return;
+      }
+
+      expect(JSON.parse(inspected.stdout)).toEqual({
+        migrations: {
+          "11": "deep scan orchestration state",
+          "12": "scan continuation threads",
+          "20": "phase-specific scan progress",
+          "25": "persist scan model settings",
+          "26": "persist scan completion warnings",
+        },
+        legacyColumnsRenamed: true,
+        deepScanTables: true,
+      });
+    },
+  );
+
+  test("aligns an existing public CLI database with the maintained plugin schema", async () => {
+    const root = await temporaryDirectory("codex-security-public-migrations-");
+    const repository = join(root, "repository");
+    const stateDirectory = join(root, "state");
+    const scanDirectory = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(stateDirectory);
+    await mkdir(scanDirectory, { mode: 0o700 });
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const fixture = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_schema import MIGRATIONS, sql_statements",
+          "repository = Path(sys.argv[2])",
+          "connection = sqlite3.connect(Path(sys.argv[3]) / 'workbench.sqlite3')",
+          "connection.execute('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')",
+          "timestamp = '2026-07-30T00:00:00Z'",
+          "for version, name, migration in MIGRATIONS:",
+          "    if version > 24: break",
+          "    for statement in sql_statements(migration): connection.execute(statement)",
+          "    connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (version, name, timestamp))",
+          "connection.execute(\"ALTER TABLE scans ADD COLUMN completion_warnings_json TEXT NOT NULL DEFAULT '[]'\")",
+          "connection.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (25, 'persist scan completion warnings', timestamp))",
+          "connection.execute('INSERT INTO workspaces (id, target_path, created_at, updated_at) VALUES (?, ?, ?, ?)', ('legacy-workspace', str(repository), timestamp, timestamp))",
+          "connection.execute('INSERT INTO scans (id, workspace_id, target_path, target_revision, scope, mode, scan_dir, status, phase, started_at, created_at, updated_at, completion_warnings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', ('legacy-scan', 'legacy-workspace', str(repository), 'legacy-revision', '.', 'standard', str(repository / 'legacy-scan'), 'complete', 'reporting', timestamp, timestamp, timestamp, '[\"existing warning\"]'))",
+          "connection.commit()",
+          "connection.close()",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        repository,
+        stateDirectory,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(fixture.status).toBe(0);
+    expect(fixture.stderr).toBe("");
+
+    const registration = await runWorkbench(
+      {
+        python: python!,
+        pluginRoot: PLUGIN_ROOT,
+        environment: {
+          PATH: process.env["PATH"],
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        },
+      },
+      [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        scanDirectory,
+        "--recipe-json",
+        JSON.stringify({
+          config: {},
+          mode: "standard",
+          repository,
+          target: { kind: "repository", paths: [] },
+        }),
+      ],
+    );
+    expect(registration["scanId"]).toBeString();
+
+    const upgraded = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, sqlite3, sys",
+          "connection = sqlite3.connect(sys.argv[1])",
+          "connection.row_factory = sqlite3.Row",
+          "columns = {row['name'] for row in connection.execute('PRAGMA table_info(scans)')}",
+          "migrations = {row['version']: row['name'] for row in connection.execute('SELECT version, name FROM schema_migrations WHERE version IN (25, 26)')}",
+          "warnings = connection.execute('SELECT completion_warnings_json FROM scans WHERE id = ?', ('legacy-scan',)).fetchone()[0]",
+          "print(json.dumps({'columns': sorted(columns & {'model', 'reasoning_effort', 'completion_warnings_json'}), 'migrations': migrations, 'warnings': json.loads(warnings)}))",
+        ].join("\n"),
+        join(stateDirectory, "workbench.sqlite3"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(upgraded.status).toBe(0);
+    expect(upgraded.stderr).toBe("");
+    expect(JSON.parse(upgraded.stdout)).toEqual({
+      columns: ["completion_warnings_json", "model", "reasoning_effort"],
+      migrations: {
+        "25": "persist scan model settings",
+        "26": "persist scan completion warnings",
+      },
+      warnings: ["existing warning"],
+    });
+  });
+
+  test.each([
+    ["all required draft artifacts", []],
+    ["the manifest draft", ["findings.json", "coverage.json"]],
+    ["the findings draft", ["scan-manifest.json", "coverage.json"]],
+    ["the coverage draft", ["scan-manifest.json", "findings.json"]],
+  ] as const)(
+    "rejects recipe scans when the agent did not create %s",
+    async (_description, present) => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const requiredDrafts = [
+        "scan-manifest.json",
+        "findings.json",
+        "coverage.json",
+      ] as const;
+      const root = await temporaryDirectory("codex-security-missing-drafts-");
+      const repository = join(root, "repository");
+      const scanDir = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(scanDir, { mode: 0o700 });
+      const workbenchOptions = {
+        python: python!,
+        pluginRoot: PLUGIN_ROOT,
+        environment: {
+          PATH: process.env["PATH"],
+          CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        },
+      };
+      const registration = await runWorkbench(workbenchOptions, [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        scanDir,
+        "--recipe-json",
+        JSON.stringify({
+          config: {},
+          mode: "standard",
+          repository,
+          target: { kind: "repository", paths: [] },
+        }),
+      ]);
+      await Promise.all(
+        present.map((filename) =>
+          copyFile(
+            join(PLUGIN_ROOT, "examples", "completed-scan", filename),
+            join(scanDir, filename),
+          ),
+        ),
+      );
+      const missing = requiredDrafts.filter(
+        (filename) => !present.some((candidate) => candidate === filename),
+      );
+
+      await expect(
+        runWorkbench(workbenchOptions, [
+          "complete-scan",
+          "--scan-id",
+          String(registration["scanId"]),
+        ]),
+      ).rejects.toThrow(
+        `Scan agent did not create required draft artifacts: ${missing.join(
+          ", ",
+        )}. Check that the scan agent can run shell commands and write to the scan directory before retrying.`,
+      );
+      expect((await readdir(scanDir)).sort()).toEqual([...present].sort());
+      const stored = await runWorkbench(workbenchOptions, [
+        "get-scan",
+        "--scan-id",
+        String(registration["scanId"]),
+      ]);
+      expect(stored["scan"]).toMatchObject({
+        progress: { status: "running" },
+      });
+    },
+  );
+
+  testPosix("rejects symlinked recipe scan draft artifacts", async () => {
+    const root = await temporaryDirectory("codex-security-symlinked-draft-");
+    const repository = join(root, "repository");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(scanDir, { mode: 0o700 });
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const workbenchOptions = {
+      python: python!,
+      pluginRoot: PLUGIN_ROOT,
+      environment: {
+        PATH: process.env["PATH"],
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      },
+    };
+    const registration = await runWorkbench(workbenchOptions, [
+      "register-cli-scan",
+      "--repository",
+      repository,
+      "--scan-dir",
+      scanDir,
+      "--recipe-json",
+      JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "repository", paths: [] },
+      }),
+    ]);
+    await symlink(
+      join(root, "missing-manifest.json"),
+      join(scanDir, "scan-manifest.json"),
+    );
+
+    await expect(
+      runWorkbench(workbenchOptions, [
+        "complete-scan",
+        "--scan-id",
+        String(registration["scanId"]),
+      ]),
+    ).rejects.toThrow(
+      "scan-manifest.json: expected a regular file inside the scan directory.",
+    );
+    expect(await readlink(join(scanDir, "scan-manifest.json"))).toBe(
+      join(root, "missing-manifest.json"),
+    );
   });
 
   test("preserves recorded artifact paths when archiving a completed scan", async () => {
@@ -1098,6 +2521,80 @@ describe("runtime directories and plugin Python boundary", () => {
         "/scan",
         1000,
       ),
+    ).not.toThrow();
+  });
+
+  testPosix(
+    "rejects scan output under a non-sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o777 });
+      await chmod(shared, 0o777);
+      const output = join(shared, "results");
+
+      await expect(prepareOutputDir(output, "repo")).rejects.toThrow(
+        "sticky bit",
+      );
+      await expect(requireSecureOutputAncestry(output)).rejects.toThrow(
+        "sticky bit",
+      );
+    },
+  );
+
+  testPosix(
+    "accepts scan output under a sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o1777 });
+      await chmod(shared, 0o1777);
+      // Some filesystems (notably user dirs on macOS APFS) ignore sticky on
+      // chmod; fall back to the process temp root when it is already sticky.
+      let stickyParent = shared;
+      if (((await lstat(shared)).mode & 0o1000) === 0) {
+        stickyParent = await realpath(tmpdir());
+        if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+          return;
+        }
+      }
+      const output = join(
+        stickyParent,
+        `codex-security-sticky-${process.pid}-${Date.now()}`,
+      );
+      temporaryDirectories.push(output);
+
+      await expect(
+        requireSecureOutputAncestry(output),
+      ).resolves.toBeUndefined();
+      expect(await prepareOutputDir(output, "repo")).toBe(output);
+    },
+  );
+
+  testPosix("rejects sticky shared parents controlled by another user", () => {
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o40755, uid: 1001 },
+        "/other-user",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1000 },
+        "/shared",
+        1000,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      requireTrustedOutputAncestor({ mode: 0o41777, uid: 0 }, "/tmp", 1000),
     ).not.toThrow();
   });
 
