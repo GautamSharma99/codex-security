@@ -76,3 +76,28 @@ def test_git_discovery_does_not_invoke_through_repository_directory_alias(
     monkeypatch.setenv("CODEX_SECURITY_GIT", str(host_alias / name))
     with pytest.raises(SystemExit, match="outside the protected repository"):
         trusted_git_executable(repository)
+
+
+def test_git_discovery_preserves_symlink_parent_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    tools = tmp_path / "tools"
+    version = tmp_path / "versions" / "v1"
+    (tools / "bin").mkdir(parents=True)
+    (version / "lib").mkdir(parents=True)
+    (version / "bin").mkdir()
+    (tools / "current").symlink_to(version / "lib", target_is_directory=True)
+    name = "git.exe" if os.name == "nt" else "git"
+    host_git = version / "bin" / name
+    for executable in (tools / "bin" / name, host_git):
+        executable.write_text("synthetic executable fixture\n")
+        executable.chmod(0o700)
+    path_entry = tools / "current" / ".." / "bin"
+    monkeypatch.delenv("CODEX_SECURITY_GIT", raising=False)
+    monkeypatch.setenv("PATH", str(path_entry))
+    expected = (path_entry / name).resolve(strict=True)
+    if os.name != "nt":
+        assert expected == host_git
+    assert trusted_git_executable(repository) == str(expected)
