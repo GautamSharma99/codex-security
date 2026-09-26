@@ -20,11 +20,7 @@ function probe(program: string, ...args: string[]): void {
     throw new Error("Python is required for workbench tests.");
   const result = Bun.spawnSync(
     [python, "-I", "-B", "-c", program, join(PLUGIN_ROOT, "scripts"), ...args],
-    {
-      env: { ...process.env, CODEX_SECURITY_GIT: Bun.which("git") ?? "" },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
+    { stdout: "pipe", stderr: "pipe" },
   );
   expect(result.exitCode, result.stderr.toString()).toBe(0);
 }

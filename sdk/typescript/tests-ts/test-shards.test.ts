@@ -194,6 +194,7 @@ test("isolated timeout", async () => {
       stdout: "ignore",
       stderr: "pipe",
       timeout: 30_000,
+      windowsHide: true,
     });
     const [status, stderr] = await Promise.all([
       child.exited,

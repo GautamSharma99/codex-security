@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
@@ -35,7 +35,10 @@ function pythonEnvironment(
   if (executable === null) throw new Error("Git is required for diff tests.");
   return {
     ...process.env,
-    CODEX_SECURITY_GIT: realpathSync(executable),
+    CODEX_SECURITY_GIT: join(
+      realpathSync(dirname(executable)),
+      basename(executable),
+    ),
     ...overrides,
   };
 }
@@ -125,7 +128,7 @@ test("diff previews stay inside the selected repository", () => {
       "--out",
       output,
     ],
-    { encoding: "utf8", env: pythonEnvironment() },
+    { encoding: "utf8" },
   );
 
   expect(result.status, result.stderr).toBe(0);
@@ -197,7 +200,7 @@ test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
       "--out",
       output,
     ],
-    { encoding: "utf8", env: pythonEnvironment() },
+    { encoding: "utf8" },
   );
   const probeSource = [
     "import json, pathlib, sys",
@@ -221,7 +224,7 @@ test("preserves Unicode Git paths and legacy-encoded commit metadata", () => {
       repository,
       legacyHead,
     ],
-    { encoding: "utf8", env: pythonEnvironment() },
+    { encoding: "utf8" },
   );
 
   expect(rank.status, `${rank.stderr}\n${String(rank.error ?? "")}`).toBe(0);
@@ -274,7 +277,7 @@ testPosix(
     writeFileSync(shim, '#!/bin/sh\n: > "$GIT_SHIM_MARKER"\nexit 99\n');
     chmodSync(shim, 0o700);
     symlinkSync(shim, join(externalBin, "git"));
-    writeFileSync(ripgrep, "#!/bin/sh\nprintf './source.py\\n'\n");
+    writeFileSync(ripgrep, "#!/bin/sh\nprintf './source.py\\000'\n");
     chmodSync(ripgrep, 0o700);
 
     const python = pythonExecutable();

@@ -174,18 +174,21 @@ def _scan_root_thread_ids(
     connection: sqlite3.Connection,
     scan: sqlite3.Row,
     supplied_thread_id: str | None,
+    *,
+    include_owner_threads: bool = True,
 ) -> list[str]:
     candidates: list[str | None] = [supplied_thread_id]
-    if "continuation_thread_id" in scan.keys():
-        candidates.append(scan["continuation_thread_id"])
-    if "deep_scan_owner_thread_id" in scan.keys():
-        candidates.append(scan["deep_scan_owner_thread_id"])
-    workspace = connection.execute(
-        "SELECT thread_id FROM workspaces WHERE id = ?",
-        (scan["workspace_id"],),
-    ).fetchone()
-    if workspace is not None:
-        candidates.append(workspace["thread_id"])
+    if include_owner_threads:
+        if "continuation_thread_id" in scan.keys():
+            candidates.append(scan["continuation_thread_id"])
+        if "deep_scan_owner_thread_id" in scan.keys():
+            candidates.append(scan["deep_scan_owner_thread_id"])
+        workspace = connection.execute(
+            "SELECT thread_id FROM workspaces WHERE id = ?",
+            (scan["workspace_id"],),
+        ).fetchone()
+        if workspace is not None:
+            candidates.append(workspace["thread_id"])
     if scan["mode"] == "deep":
         candidates.extend(
             row["sdk_thread_id"]
@@ -206,6 +209,16 @@ def _scan_root_thread_ids(
             roots.append(candidate)
             seen.add(candidate)
     return roots
+
+
+def _scan_execution_thread_ids(connection: sqlite3.Connection, scan: sqlite3.Row) -> list[str]:
+    # CLI recipes identify dedicated executions; Desktop continuations can be shared.
+    return _scan_root_thread_ids(
+        connection,
+        scan,
+        scan["continuation_thread_id"] if scan["recipe_json"] is not None else None,
+        include_owner_threads=False,
+    )
 
 
 def _codex_state_database() -> Path | None:
@@ -501,19 +514,20 @@ def _is_owned_task_start(
     turn_id = payload.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id:
         return False
-    thread_timestamp = _uuid7_timestamp(thread_id)
-    turn_timestamp = _uuid7_timestamp(turn_id)
-    if thread_timestamp is None:
+    # Fresh Codex worker thread/turn IDs use a same-process monotonic UUIDv7 generator.
+    thread_order = _uuid7_order(thread_id)
+    turn_order = _uuid7_order(turn_id)
+    if thread_order is None:
         return True
-    return turn_timestamp is not None and turn_timestamp >= thread_timestamp
+    return turn_order is not None and turn_order >= thread_order
 
 
-def _uuid7_timestamp(value: str) -> int | None:
+def _uuid7_order(value: str) -> int | None:
     try:
         parsed = uuid.UUID(value)
     except ValueError:
         return None
-    return parsed.int >> 80 if parsed.version == 7 else None
+    return parsed.int if parsed.version == 7 else None
 
 
 def _token_snapshot(payload: Mapping[str, Any]) -> dict[str, int] | None:

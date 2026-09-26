@@ -465,13 +465,7 @@ describe("malformed scan artifact recovery", () => {
             fixture.repository,
             join(fixture.stateDir, "checkout"),
           ],
-          {
-            encoding: "utf8",
-            env: {
-              ...process.env,
-              CODEX_SECURITY_GIT: Bun.which("git") ?? "",
-            },
-          },
+          { encoding: "utf8" },
         );
         expect(copied.status, copied.stderr).toBe(0);
       }

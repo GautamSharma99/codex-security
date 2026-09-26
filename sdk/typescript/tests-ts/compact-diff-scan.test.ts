@@ -50,13 +50,6 @@ function git(repository: string, ...args: string[]): string {
   ).trim();
 }
 
-function gitExecutable(): string {
-  const executable = Bun.which("git");
-  expect(executable).not.toBeNull();
-  if (executable === null) throw new Error("Git is required for diff tests.");
-  return executable;
-}
-
 function writeSource(
   repository: string,
   path: string,
@@ -74,10 +67,7 @@ function python(script: string, ...args: string[]) {
   return spawnSync(
     command!,
     ["-B", join(PLUGIN_ROOT, "scripts", script), ...args],
-    {
-      encoding: "utf8",
-      env: { ...process.env, CODEX_SECURITY_GIT: gitExecutable() },
-    },
+    { encoding: "utf8" },
   );
 }
 
@@ -97,7 +87,6 @@ async function startMcp(root: string) {
     {
       env: {
         ...process.env,
-        CODEX_SECURITY_GIT: gitExecutable(),
         CODEX_SECURITY_SCAN_ROOT: join(root, "scans"),
         CODEX_SECURITY_STATE_DIR: join(root, "state"),
         PYTHONDONTWRITEBYTECODE: "1",
@@ -307,14 +296,7 @@ describe("compact diff scan", () => {
         "--out",
         output,
       ],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          CODEX_SECURITY_GIT: gitExecutable(),
-          PYTHONUTF8: "0",
-        },
-      },
+      { encoding: "utf8", env: { ...process.env, PYTHONUTF8: "0" } },
     );
 
     expect(result.status, result.stderr).toBe(0);

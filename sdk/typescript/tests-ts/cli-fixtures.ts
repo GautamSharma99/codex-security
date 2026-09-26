@@ -202,6 +202,7 @@ export function dependencies(
     onWorkbench?: (
       args: readonly string[],
       input?: string,
+      signal?: AbortSignal,
     ) => JsonObject | Promise<JsonObject>;
     onMatch?: MainDependencies["matchFindings"];
     onUpdateCheck?: (signal: AbortSignal) => Promise<UpdateNotice | undefined>;
@@ -270,7 +271,7 @@ export function dependencies(
         args,
         repository,
         commandOptions,
-      )) ?? "",
+      )) ?? (args.includes("--name-only") ? "src/finding-1.ts\0" : ""),
     ...(options.bulkScan === undefined ? {} : { bulkScan: options.bulkScan }),
     ...(options.linearClient === undefined
       ? {}
@@ -278,10 +279,13 @@ export function dependencies(
     ...(options.importGitHubAlerts === undefined
       ? {}
       : { importGitHubAlerts: options.importGitHubAlerts }),
-    runWorkbench: async (args, input) =>
-      (await options.onWorkbench?.(args, input)) ?? { scans: [] },
-    matchFindings: async (input) =>
-      (await options.onMatch?.(input)) ?? { matches: [], uncertain: [] },
+    runWorkbench: async (args, input, signal) =>
+      (await options.onWorkbench?.(args, input, signal)) ?? { scans: [] },
+    matchFindings: async (input, comparisonOptions) =>
+      (await options.onMatch?.(input, comparisonOptions)) ?? {
+        matches: [],
+        uncertain: [],
+      },
     exportFindings: async (arguments_) =>
       new TextEncoder().encode(
         arguments_.format === "csv"
