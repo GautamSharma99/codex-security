@@ -94,7 +94,7 @@ def trusted_git_executable(protected_root: Path) -> str | None:
     if configured is None:
         names = ("git.exe", "git.com") if windows else ("git",)
         candidates = (
-            Path(os.path.abspath(Path(entry.strip('"') if windows else entry) / name))
+            Path(entry.strip('"') if windows else entry) / name
             for entry in os.get_exec_path()
             for name in names
         )
@@ -113,6 +113,7 @@ def trusted_git_executable(protected_root: Path) -> str | None:
 
     for candidate in candidates:
         try:
+            lexical = Path(os.path.abspath(candidate))
             invocation = candidate.parent.resolve(strict=True) / candidate.name
             canonical = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
@@ -131,7 +132,7 @@ def trusted_git_executable(protected_root: Path) -> str | None:
             continue
         if any(
             path == repository or repository in path.parents
-            for path in (candidate, invocation, canonical)
+            for path in (lexical, invocation, canonical)
         ):
             if configured is not None:
                 raise SystemExit("CODEX_SECURITY_GIT must stay outside the protected repository.")
