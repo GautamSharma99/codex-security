@@ -61,11 +61,9 @@ import {
 } from "./errors.js";
 import type { JsonObject } from "./config.js";
 import {
-  inspectTrustedExecutable,
   resolveTrustedExecutable,
   type InspectedExecutable,
 } from "./trusted-executable.js";
-import { gitMarkerRoot } from "./targets.js";
 import {
   isWindowsUnsafePathComponent,
   windowsUnsafePathComponent,
@@ -1579,20 +1577,10 @@ export async function runWorkbench(
     arguments_: readonly string[],
     input?: string,
   ): Promise<string> => {
-    const git =
-      options.git ??
-      (await inspectTrustedExecutable(
-        "git",
-        options.environment,
-        (await gitMarkerRoot(process.cwd(), options.signal, "outermost")) ??
-          process.cwd(),
-      ));
     const environment = pluginHelperEnvironment(
-      pluginExecutionEnvironmentWithGit(
-        options.python,
-        options.environment,
-        git,
-      ),
+      options.git === undefined
+        ? options.environment
+        : environmentWithGit(options.environment, options.git),
     );
     const result = await runCodexCommand(
       { command: options.python },
@@ -2704,12 +2692,11 @@ export function pluginExecutionEnvironment(
   };
 }
 
-export function pluginExecutionEnvironmentWithGit(
-  python: string,
+export function environmentWithGit(
   environment: ProcessEnvironment,
   git: InspectedExecutable,
 ): ProcessEnvironment {
-  const result = pluginExecutionEnvironment(python, environment);
+  const result = { ...environment };
   for (const name of Object.keys(result)) {
     const normalized = name.toUpperCase();
     if (normalized === "CODEX_SECURITY_GIT" || normalized === "PATH") {
