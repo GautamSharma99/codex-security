@@ -180,7 +180,7 @@ import {
   importAmbientAuth,
   prepareCodexSecurityCredentialHome,
   preserveCodexSecurityPluginRegistration,
-  pluginExecutionEnvironment,
+  pluginExecutionEnvironmentWithGit,
   pluginMetadata,
   planOutputArchive,
   prepareScanArtifactRestorer,
@@ -207,6 +207,7 @@ import {
   enclosingGitWorktreeRoots,
   normalizeRepository,
   normalizeTarget,
+  gitMarkerRoot,
   repositoryRevision,
   resolveRepositoryPath,
   type NormalizedTarget,
@@ -215,6 +216,10 @@ import {
   validateCommittedDiffCheckout,
   validateMode,
 } from "./targets.js";
+import {
+  inspectTrustedExecutable,
+  type InspectedExecutable,
+} from "./trusted-executable.js";
 
 interface CodexThreadLike {
   readonly id: string | null;
@@ -683,6 +688,15 @@ export class CodexSecurity {
           CODEX_SECURITY_SURFACE: this.#surface,
         },
         options.auth,
+        await inspectGitForSources(
+          selectedScanEnvironment(
+            runtime.environment,
+            options.auth,
+            session.modelProvider,
+          ),
+          [inputs.repository],
+          signal,
+        ),
       );
       const thread = codex.startThread({
         threadSource: CODEX_SECURITY_THREAD_SOURCES.validation,
@@ -1002,6 +1016,15 @@ export class CodexSecurity {
             : { CODEX_SECURITY_KNOWLEDGE_BASE: knowledgeBase.path }),
         },
         options.auth,
+        await inspectGitForSources(
+          selectedScanEnvironment(
+            runtime.environment,
+            options.auth,
+            session.modelProvider,
+          ),
+          [target.repository, ...(knowledgeBase?.sources ?? [])],
+          signal,
+        ),
         policyCodexConfig(session.sessionConfig),
         inputs.gitMetadataPaths.length === 0
           ? []
@@ -1290,6 +1313,17 @@ export class CodexSecurity {
         python,
       } = session;
       releaseCredentialHome = session.releaseCredentialHome;
+      const pluginEnvironment = selectedScanEnvironment(
+        runtime.environment,
+        options.auth,
+        modelProvider,
+      );
+      const git = await inspectGitForSources(
+        pluginEnvironment,
+        [repo, ...(knowledgeBase?.sources ?? [])],
+        signal,
+      );
+      checkOpen();
       const deepScanConfigPath =
         mode === "deep"
           ? (runtime.deepScanConfigPath ??
@@ -1577,13 +1611,10 @@ export class CodexSecurity {
         python,
         pluginRoot: runtime.plugin.pluginRoot,
         environment: {
-          ...selectedScanEnvironment(
-            runtime.environment,
-            options.auth,
-            modelProvider,
-          ),
+          ...pluginEnvironment,
           CODEX_SECURITY_STATE_DIR: stateDirectory,
         },
+        git,
         signal,
         failureMessage: "Could not save the Codex Security scan",
       };
@@ -1882,6 +1913,7 @@ export class CodexSecurity {
         session,
         runtimePaths,
         options.auth,
+        git,
       );
       const threadOptions: ThreadOptions = {
         threadSource: CODEX_SECURITY_THREAD_SOURCES.scan,
@@ -2623,6 +2655,7 @@ export class CodexSecurity {
     session: PreparedSession,
     runtimePaths: Record<string, string>,
     auth: ScanAuthMode = "auto",
+    git: InspectedExecutable,
     config?: JsonObject,
     configOverrides: string[] = [],
   ): { codex: CodexClientLike; environment: ProcessEnvironment } {
@@ -2636,7 +2669,7 @@ export class CodexSecurity {
     } = session;
     const commandAuth = hasCommandAuth(sessionConfig);
     const environment: ProcessEnvironment = {
-      ...pluginExecutionEnvironment(
+      ...pluginExecutionEnvironmentWithGit(
         python,
         withoutCodexHome(
           selectedScanEnvironment(
@@ -2647,6 +2680,7 @@ export class CodexSecurity {
             modelProvider,
           ),
         ),
+        git,
       ),
       ...(externalProvider === null
         ? {}
@@ -3575,6 +3609,22 @@ export async function initialCredentialsAvailable(
   }
   if (await codexSecurityHasStoredFileCredentials(isolatedHome)) return true;
   return await importer(ambientHome, isolatedHome);
+}
+
+async function inspectGitForSources(
+  environment: ProcessEnvironment,
+  sources: readonly string[],
+  signal?: AbortSignal,
+): Promise<InspectedExecutable> {
+  let git: InspectedExecutable = { executable: null, environment };
+  for (const source of sources) {
+    git = await inspectTrustedExecutable(
+      "git",
+      git.environment,
+      (await gitMarkerRoot(source, signal, "outermost")) ?? source,
+    );
+  }
+  return git;
 }
 
 // Reports a cleanup failure without letting it decide the result of the scan. Only the

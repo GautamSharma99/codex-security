@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -175,7 +176,14 @@ def test_inventory_rejects_line_breaks_before_serializing_paths(
     assert list(output.parent.glob(f".{output.name}.*.tmp")) == []
 
 
-def test_diff_inventory_includes_power_shell_files(tmp_path: Path) -> None:
+@pytest.mark.parametrize("host_binding", [True, False])
+def test_diff_inventory_includes_power_shell_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_binding: bool
+) -> None:
+    if host_binding:
+        monkeypatch.setenv("CODEX_SECURITY_GIT", shutil.which("git") or "")
+    else:
+        monkeypatch.delenv("CODEX_SECURITY_GIT", raising=False)
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(
