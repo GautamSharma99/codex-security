@@ -24,6 +24,19 @@ def initialize_unborn_git_repository(target: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=target, check=True)
 
 
+def test_stale_git_binding_does_not_spawn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_SECURITY_GIT", str(tmp_path / "missing-git"))
+
+    def unexpected_spawn(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("stale Git binding reached subprocess.run")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_spawn)
+    result = WORKBENCH_TARGET["git_command"](tmp_path, "status", text=True)
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert result.args[0] == "git"
+
+
 @pytest.mark.parametrize(
     ("log_encoding", "subject"),
     [

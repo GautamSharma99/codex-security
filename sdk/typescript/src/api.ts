@@ -1612,10 +1612,9 @@ export class CodexSecurity {
         python,
         pluginRoot: runtime.plugin.pluginRoot,
         environment: {
-          ...pluginEnvironment,
+          ...environmentWithGit(pluginEnvironment, git),
           CODEX_SECURITY_STATE_DIR: stateDirectory,
         },
-        git,
         signal,
         failureMessage: "Could not save the Codex Security scan",
       };

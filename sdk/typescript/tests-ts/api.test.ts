@@ -2563,7 +2563,7 @@ describe("CodexSecurity orchestration", () => {
           input?: string,
         ): Promise<JsonObject> => {
           workbenchGitExecutables.push(
-            workbenchOptions.git?.executable ?? null,
+            workbenchOptions.environment["CODEX_SECURITY_GIT"] ?? null,
           );
           commands.push(args);
           if (args[0] === "register-cli-scan") {
@@ -5206,7 +5206,8 @@ describe("CodexSecurity orchestration", () => {
             args: readonly string[],
             input?: string,
           ): Promise<JsonObject> => {
-            workbenchGit = workbenchOptions.git?.executable ?? "";
+            workbenchGit =
+              workbenchOptions.environment["CODEX_SECURITY_GIT"] ?? "";
             if (args[0] === "get-scan-feedback") {
               return {
                 scanId: "scan_example_001",

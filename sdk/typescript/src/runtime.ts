@@ -161,7 +161,6 @@ export interface WorkbenchCommandOptions {
   python: string;
   pluginRoot: string;
   environment: ProcessEnvironment;
-  git?: InspectedExecutable;
   signal?: AbortSignal;
   failureMessage?: string;
 }
@@ -1577,15 +1576,10 @@ export async function runWorkbench(
     arguments_: readonly string[],
     input?: string,
   ): Promise<string> => {
-    const environment = pluginHelperEnvironment(
-      options.git === undefined
-        ? options.environment
-        : environmentWithGit(options.environment, options.git),
-    );
     const result = await runCodexCommand(
       { command: options.python },
       ["-I", "-X", "utf8", "-B", script, ...arguments_],
-      environment,
+      pluginHelperEnvironment(options.environment),
       input,
       options.signal,
     );

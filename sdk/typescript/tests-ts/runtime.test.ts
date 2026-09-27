@@ -4876,23 +4876,25 @@ describe("runtime directories and plugin Python boundary", () => {
         launch === "repository" ? nestedDirectory : launchHome,
       );
       try {
+        const environment = {
+          PATH: [untrustedBin, hostBin].join(delimiter),
+          GIT_SSH_COMMAND: "synthetic-ssh",
+        };
         const result = await runWorkbench(
           {
             python,
             pluginRoot,
-            environment: {
-              PATH: [untrustedBin, hostBin].join(delimiter),
-              GIT_SSH_COMMAND: "synthetic-ssh",
-            },
-            ...(launch === "bound"
-              ? {
-                  git: await inspectTrustedExecutable(
-                    "git",
-                    { PATH: [untrustedBin, hostBin].join(delimiter) },
-                    repository,
-                  ),
-                }
-              : {}),
+            environment:
+              launch === "bound"
+                ? environmentWithGit(
+                    environment,
+                    await inspectTrustedExecutable(
+                      "git",
+                      environment,
+                      repository,
+                    ),
+                  )
+                : environment,
           },
           [repository],
         );

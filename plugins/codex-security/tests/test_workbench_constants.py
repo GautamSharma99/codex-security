@@ -13,6 +13,37 @@ CONSTANTS = runpy.run_path(
 trusted_git_executable = CONSTANTS["trusted_git_executable"]
 
 
+def test_windows_git_candidates_reject_batch_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    native = tmp_path / "git.com"
+    batch = tmp_path / "git.cmd"
+    extensionless = tmp_path / "git-native"
+    for candidate in (native, batch, extensionless):
+        candidate.write_text("synthetic executable fixture\n")
+    native_alias = tmp_path / "trusted.exe"
+    batch_alias = tmp_path / "untrusted.exe"
+    extensionless_alias = tmp_path / "native-alias.exe"
+    native_alias.symlink_to(native)
+    batch_alias.symlink_to(batch)
+    extensionless_alias.symlink_to(extensionless)
+    monkeypatch.setitem(
+        trusted_git_executable.__globals__, "sys", SimpleNamespace(platform="win32")
+    )
+    for candidate, expected in (
+        (native, native),
+        (native_alias, native_alias),
+        (batch, None),
+        (batch_alias, None),
+        (extensionless, None),
+        (extensionless_alias, extensionless_alias),
+    ):
+        monkeypatch.setenv("CODEX_SECURITY_GIT", str(candidate))
+        assert trusted_git_executable(repository) == (str(expected) if expected else None)
+
+
 @pytest.mark.parametrize("windows", [False, True])
 def test_git_discovery_continues_past_repository_tools_and_batch_shims(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows: bool
