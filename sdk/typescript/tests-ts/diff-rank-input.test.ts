@@ -27,22 +27,6 @@ function pythonExecutable(): string | null {
   );
 }
 
-function pythonEnvironment(
-  overrides: NodeJS.ProcessEnv = {},
-): NodeJS.ProcessEnv {
-  const executable = Bun.which("git");
-  expect(executable).not.toBeNull();
-  if (executable === null) throw new Error("Git is required for diff tests.");
-  return {
-    ...process.env,
-    CODEX_SECURITY_GIT: join(
-      realpathSync(dirname(executable)),
-      basename(executable),
-    ),
-    ...overrides,
-  };
-}
-
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -274,93 +258,71 @@ testPosix(
     git(repository, "add", ".");
     git(repository, "commit", "-qm", "head");
     const head = git(repository, "rev-parse", "HEAD");
+    writeFileSync(join(repository, ".gitignore"), "source.py\n");
     writeFileSync(shim, '#!/bin/sh\n: > "$GIT_SHIM_MARKER"\nexit 99\n');
     chmodSync(shim, 0o700);
     symlinkSync(shim, join(externalBin, "git"));
-    writeFileSync(ripgrep, "#!/bin/sh\nprintf './source.py\\000'\n");
+    writeFileSync(ripgrep, "#!/bin/sh\nexit 0\n");
     chmodSync(ripgrep, 0o700);
 
     const python = pythonExecutable();
+    const hostGit = Bun.which("git");
     expect(python).not.toBeNull();
-    const rankOutput = join(root, "rank.jsonl");
-    const inventoryOutput = join(root, "inventory.txt");
-    const environment = {
-      PATH: `${externalBin}:${process.env["PATH"] ?? ""}`,
-      GIT_SHIM_MARKER: marker,
-    };
+    expect(hostGit).not.toBeNull();
+    const trustedGit = join(
+      realpathSync(dirname(hostGit!)),
+      basename(hostGit!),
+    );
+    const output = join(root, "output");
+    const run = (script: string, args: string[], binding = trustedGit) =>
+      spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", script),
+          ...args,
+          "--repo",
+          repository,
+          "--out",
+          output,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${externalBin}:${process.env["PATH"] ?? ""}`,
+            GIT_SHIM_MARKER: marker,
+            CODEX_SECURITY_GIT: binding,
+          },
+        },
+      );
     const rankArguments = [
-      "-I",
-      "-B",
-      join(PLUGIN_ROOT, "scripts", "generate_rank_input.py"),
       "make-diff-rank-input",
-      "--repo",
-      repository,
       "--base",
       base,
       "--head",
       head,
-      "--out",
-      rankOutput,
     ];
-
-    const unavailable = spawnSync(python!, rankArguments, {
-      encoding: "utf8",
-      env: pythonEnvironment({ ...environment, CODEX_SECURITY_GIT: "" }),
-    });
+    const unavailable = run("generate_rank_input.py", rankArguments, "");
     expect(unavailable.status).not.toBe(0);
-
-    const rejected = spawnSync(python!, rankArguments, {
-      encoding: "utf8",
-      env: pythonEnvironment({ ...environment, CODEX_SECURITY_GIT: shim }),
-    });
+    const rejected = run("generate_rank_input.py", rankArguments, shim);
     expect(rejected.status).not.toBe(0);
     expect(rejected.stderr).toContain("outside the protected repository");
-
-    const rank = spawnSync(python!, rankArguments, {
-      encoding: "utf8",
-      env: pythonEnvironment(environment),
-    });
+    const rank = run("generate_rank_input.py", rankArguments);
     expect(rank.status, rank.stderr).toBe(0);
 
-    const inventory = spawnSync(
-      python!,
-      [
-        "-I",
-        "-B",
-        join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
-        "--repo",
-        repository,
+    for (const diff of [true, false]) {
+      const inventory = run("generate_in_scope_files.py", [
         "--scope",
         ".",
-        "--diff-base",
-        base,
-        "--diff-head",
-        head,
-        "--out",
-        inventoryOutput,
-      ],
-      { encoding: "utf8", env: pythonEnvironment(environment) },
-    );
-    expect(inventory.status, inventory.stderr).toBe(0);
-    expect(readFileSync(inventoryOutput, "utf8")).toBe("source.py\n");
-
-    const codebaseInventory = spawnSync(
-      python!,
-      [
-        "-I",
-        "-B",
-        join(PLUGIN_ROOT, "scripts", "generate_in_scope_files.py"),
-        "--repo",
-        repository,
-        "--scope",
-        ".",
-        "--out",
-        inventoryOutput,
-      ],
-      { encoding: "utf8", env: pythonEnvironment(environment) },
-    );
-    expect(codebaseInventory.status, codebaseInventory.stderr).toBe(0);
-    expect(readFileSync(inventoryOutput, "utf8")).toContain("./source.py\n");
+        ...(diff ? ["--diff-base", base, "--diff-head", head] : []),
+      ]);
+      expect(inventory.status, inventory.stderr).toBe(0);
+      expect(readFileSync(output, "utf8")).toBe(
+        diff ? "source.py\n" : "./source.py\n",
+      );
+    }
     expect(existsSync(marker)).toBe(false);
   },
 );

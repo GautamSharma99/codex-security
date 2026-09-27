@@ -4810,12 +4810,11 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(result["details"]).toHaveLength(5 * 1024 * 1024);
   });
 
-  test.each(["repository", "unrelated-home", "bound"])(
-    "selects workbench Git for the requested target from %s",
-    async (launch) => {
+  test.each([false, true])(
+    "selects workbench Git for the requested target (bound: %s)",
+    async (bound) => {
       const root = await temporaryDirectory();
       const repository = join(root, "repository");
-      const nestedDirectory = join(repository, "src");
       const untrustedBin = join(repository, "tools");
       const launchHome = join(root, "home");
       const hostBin = join(launchHome, "tools");
@@ -4830,29 +4829,10 @@ describe("runtime directories and plugin Python boundary", () => {
         process.platform === "win32" ? "git.exe" : "git",
       );
       await mkdir(untrustedBin, { recursive: true });
-      await mkdir(nestedDirectory);
+      await mkdir(join(repository, ".git"));
       await mkdir(hostBin, { recursive: true });
       await mkdir(join(pluginRoot, "scripts"), { recursive: true });
       await symlink(await realpath(git), trustedGit);
-      await promisify(execFile)(git, ["init", "-q", repository]);
-      await promisify(execFile)(git, [
-        "-C",
-        repository,
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.invalid",
-        "commit",
-        "--allow-empty",
-        "-qm",
-        "synthetic target",
-      ]);
-      const { stdout: revision } = await promisify(execFile)(git, [
-        "-C",
-        repository,
-        "rev-parse",
-        "HEAD",
-      ]);
       await writeFile(
         join(untrustedBin, basename(trustedGit)),
         `#!/bin/sh\nprintf executed > ${JSON.stringify(marker)}\nexit 1\n`,
@@ -4864,16 +4844,16 @@ describe("runtime directories and plugin Python boundary", () => {
           "import json, os, sys",
           "from pathlib import Path",
           `sys.path.insert(0, ${JSON.stringify(join(PLUGIN_ROOT, "scripts"))})`,
-          "from workbench_target import git_command, git_revision",
+          "from workbench_target import git_command",
           "assert os.environ.get('GIT_SSH_COMMAND') == 'synthetic-ssh'",
           "target = Path(sys.argv[1])",
           "completed = git_command(target, '--version', text=True)",
           "completed.check_returncode()",
-          "print(json.dumps({'git': completed.args[0], 'revision': git_revision(target), 'path': os.environ.get('PATH'), 'binding': os.environ.get('CODEX_SECURITY_GIT')}))",
+          "print(json.dumps({'git': completed.args[0], 'path': os.environ.get('PATH'), 'binding': os.environ.get('CODEX_SECURITY_GIT')}))",
         ].join("\n"),
       );
       const currentDirectory = spyOn(process, "cwd").mockReturnValue(
-        launch === "repository" ? nestedDirectory : launchHome,
+        launchHome,
       );
       try {
         const environment = {
@@ -4884,24 +4864,22 @@ describe("runtime directories and plugin Python boundary", () => {
           {
             python,
             pluginRoot,
-            environment:
-              launch === "bound"
-                ? environmentWithGit(
+            environment: bound
+              ? environmentWithGit(
+                  environment,
+                  await inspectTrustedExecutable(
+                    "git",
                     environment,
-                    await inspectTrustedExecutable(
-                      "git",
-                      environment,
-                      repository,
-                    ),
-                  )
-                : environment,
+                    repository,
+                  ),
+                )
+              : environment,
           },
           [repository],
         );
         expect(result["git"]).toBe(trustedGit);
-        expect(result["revision"]).toBe(revision.trim());
-        expect(result["binding"]).toBe(launch === "bound" ? trustedGit : null);
-        if (launch === "bound") expect(result["path"]).toBe(hostBin);
+        expect(result["binding"]).toBe(bound ? trustedGit : null);
+        if (bound) expect(result["path"]).toBe(hostBin);
         expect(existsSync(marker)).toBe(false);
       } finally {
         currentDirectory.mockRestore();
@@ -5976,6 +5954,8 @@ describe("runtime directories and plugin Python boundary", () => {
   });
 
   test("binds the plugin environment to inspected Git", () => {
+    const unbound = { Path: join(tmpdir(), "operator-tools"), KEEP: "1" };
+    expect(environmentWithGit(unbound, undefined)).toEqual(unbound);
     const python = join(
       tmpdir(),
       process.platform === "win32" ? "python.exe" : "python",

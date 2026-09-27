@@ -627,8 +627,6 @@ def run_git_changed_paths(repo: Path, diff_args: list[str]) -> list[tuple[Path, 
     result = git_command(
         repo,
         "diff",
-        "--no-ext-diff",
-        "--no-textconv",
         "--name-status",
         "-z",
         "--diff-filter=ACMRD",

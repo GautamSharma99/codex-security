@@ -689,15 +689,6 @@ export class CodexSecurity {
           CODEX_SECURITY_SURFACE: this.#surface,
         },
         options.auth,
-        await inspectGitForSources(
-          selectedScanEnvironment(
-            runtime.environment,
-            options.auth,
-            session.modelProvider,
-          ),
-          [inputs.repository],
-          signal,
-        ),
       );
       const thread = codex.startThread({
         threadSource: CODEX_SECURITY_THREAD_SOURCES.validation,
@@ -1017,15 +1008,7 @@ export class CodexSecurity {
             : { CODEX_SECURITY_KNOWLEDGE_BASE: knowledgeBase.path }),
         },
         options.auth,
-        await inspectGitForSources(
-          selectedScanEnvironment(
-            runtime.environment,
-            options.auth,
-            session.modelProvider,
-          ),
-          [target.repository, ...(knowledgeBase?.sources ?? [])],
-          signal,
-        ),
+        undefined,
         policyCodexConfig(session.sessionConfig),
         inputs.gitMetadataPaths.length === 0
           ? []
@@ -2655,7 +2638,7 @@ export class CodexSecurity {
     session: PreparedSession,
     runtimePaths: Record<string, string>,
     auth: ScanAuthMode = "auto",
-    git: InspectedExecutable,
+    git?: InspectedExecutable,
     config?: JsonObject,
     configOverrides: string[] = [],
   ): { codex: CodexClientLike; environment: ProcessEnvironment } {

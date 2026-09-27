@@ -2688,8 +2688,9 @@ export function pluginExecutionEnvironment(
 
 export function environmentWithGit(
   environment: ProcessEnvironment,
-  git: InspectedExecutable,
+  git?: InspectedExecutable,
 ): ProcessEnvironment {
+  if (git === undefined) return environment;
   const result = { ...environment };
   for (const name of Object.keys(result)) {
     const normalized = name.toUpperCase();

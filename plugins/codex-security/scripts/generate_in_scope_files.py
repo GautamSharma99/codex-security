@@ -159,8 +159,6 @@ def committed_changed_paths(repository: Path, base: str, head: str) -> list[tupl
     result = git_command(
         repository,
         "diff",
-        "--no-ext-diff",
-        "--no-textconv",
         "--raw",
         "-z",
         "--diff-filter=ACMRD",
