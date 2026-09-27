@@ -1297,16 +1297,21 @@ export class CodexSecurity {
         python,
       } = session;
       releaseCredentialHome = session.releaseCredentialHome;
-      const pluginEnvironment = selectedScanEnvironment(
-        runtime.environment,
-        options.auth,
-        modelProvider,
-      );
-      const git = await inspectGitForSources(
-        pluginEnvironment,
-        [repo, ...(knowledgeBase?.sources ?? [])],
-        signal,
-      );
+      let git: InspectedExecutable = {
+        executable: null,
+        environment: selectedScanEnvironment(
+          runtime.environment,
+          options.auth,
+          modelProvider,
+        ),
+      };
+      for (const source of [repo, ...(knowledgeBase?.sources ?? [])]) {
+        git = await inspectTrustedExecutable(
+          "git",
+          git.environment,
+          (await gitMarkerRoot(source, signal, "outermost")) ?? source,
+        );
+      }
       checkOpen();
       const deepScanConfigPath =
         mode === "deep"
@@ -1595,7 +1600,7 @@ export class CodexSecurity {
         python,
         pluginRoot: runtime.plugin.pluginRoot,
         environment: {
-          ...environmentWithGit(pluginEnvironment, git),
+          ...environmentWithGit(git.environment, git),
           CODEX_SECURITY_STATE_DIR: stateDirectory,
         },
         signal,
@@ -3594,22 +3599,6 @@ export async function initialCredentialsAvailable(
   }
   if (await codexSecurityHasStoredFileCredentials(isolatedHome)) return true;
   return await importer(ambientHome, isolatedHome);
-}
-
-async function inspectGitForSources(
-  environment: ProcessEnvironment,
-  sources: readonly string[],
-  signal?: AbortSignal,
-): Promise<InspectedExecutable> {
-  let git: InspectedExecutable = { executable: null, environment };
-  for (const source of sources) {
-    git = await inspectTrustedExecutable(
-      "git",
-      git.environment,
-      (await gitMarkerRoot(source, signal, "outermost")) ?? source,
-    );
-  }
-  return git;
 }
 
 // Reports a cleanup failure without letting it decide the result of the scan. Only the
