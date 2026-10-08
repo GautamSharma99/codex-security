@@ -94,6 +94,10 @@ export async function loadContractWithScanDirectory(
   scanDirectory: string,
   options: LoadContractOptions,
 ): Promise<{ contract: LoadedContract; scanDirectory: string }> {
+  const validators = await loadContractValidators(
+    options.pluginRoot,
+    options.signal,
+  );
   const scanRoot = await requireScanRoot(scanDirectory, options.signal);
   const scanDir = scanRoot.path;
   const documentDigests = new Map<string, string>();
@@ -123,20 +127,10 @@ export async function loadContractWithScanDirectory(
   throwIfAborted(options.signal);
   let findingsPayload: unknown = payloads["findings.json"];
 
-  const ajv = createValidator();
-  for (const [filename, schemaName] of Object.entries(DOCUMENTS)) {
-    const schema = await readJson(
-      join(options.pluginRoot, "schemas", schemaName),
-      options.signal,
-    ).catch((error: unknown) => {
-      throwIfAborted(options.signal);
-      throw new ContractSchemaError(errorMessage(error), { cause: error });
-    });
-    let validate: ReturnType<typeof ajv.compile>;
+  for (const { filename, schemaName, validate } of validators) {
     let payload: unknown;
     let valid: boolean;
     try {
-      validate = ajv.compile(schema);
       payload =
         filename === "findings.json"
           ? findingsPayload
@@ -1007,6 +1001,34 @@ function createValidator(): Ajv2020 {
     validate: validRfc3339DateTime,
   });
   return ajv;
+}
+
+async function loadContractValidators(
+  pluginRoot: string,
+  signal?: AbortSignal,
+) {
+  const ajv = createValidator();
+  const validators = [];
+  for (const [filename, schemaName] of Object.entries(DOCUMENTS)) {
+    const schema = await readJson(
+      join(pluginRoot, "schemas", schemaName),
+      signal,
+    ).catch((error: unknown) => {
+      throwIfAborted(signal);
+      throw new ContractSchemaError(errorMessage(error), { cause: error });
+    });
+    try {
+      const validate = ajv.compile(schema);
+      if (validate.$async) {
+        throw new Error("asynchronous JSON Schema validation is unsupported");
+      }
+      validators.push({ filename, schemaName, validate });
+    } catch {
+      throw new ContractSchemaError(`${schemaName}: invalid JSON Schema.`);
+    }
+    throwIfAborted(signal);
+  }
+  return validators;
 }
 
 async function sha256ScanFile(

@@ -2308,32 +2308,83 @@ describe("multiscan", () => {
     }
   });
 
-  test.each(["missing", "invalid JSON", "invalid schema"])(
-    "keeps completed results when the configured plugin schema is %s",
-    async (problem) => {
+  test.each([
+    ["missing", "valid", false],
+    ["invalid JSON", "valid", false],
+    ["invalid schema", "valid", false],
+    ["missing", "malformed", false],
+    ["missing", "malformed", true],
+    ["invalid JSON", "schema-invalid", false],
+    ["invalid JSON", "schema-invalid", true],
+    ["invalid schema", "missing", false],
+    ["invalid schema", "missing", true],
+    ["async", "malformed", false],
+  ] as const)(
+    "keeps completed artifacts when the plugin schema is %s and output is %s with recovery=%p",
+    async (problem, output, recovery) => {
       const { paths } = await repositoryFixture("schema-error");
       const pluginPath = await customPlugin(paths.root, "directory");
       const run = mock(completeRun);
+      const createSecurity = mock(() => client(run));
       const configured = options(paths, client(run), {
         config: { pluginPath },
+        createSecurity,
       });
       await runMultiscan(configured);
       const ledger = join(paths.output, "results.jsonl");
       const before = await readFile(ledger, "utf8");
+      const [receipt] = await results(ledger);
+      const scanDir = receipt!["outputDir"] as string;
+      if (output === "malformed")
+        await writeFile(join(scanDir, "findings.json"), "");
+      else if (output === "schema-invalid")
+        await writeFile(join(scanDir, "scan-manifest.json"), "{}");
+      else if (output === "missing") await rm(join(scanDir, "findings.json"));
+      const artifactBytes = async () =>
+        Promise.all(
+          [
+            "scan-manifest.json",
+            "findings.json",
+            "coverage.json",
+            "report.md",
+          ].map(async (name) =>
+            readFile(join(scanDir, name)).catch(
+              (error: NodeJS.ErrnoException) => {
+                if (error.code === "ENOENT") return null;
+                throw error;
+              },
+            ),
+          ),
+        );
+      const savedArtifacts = await artifactBytes();
       const schema = join(pluginPath, "schemas", "coverage.schema.json");
       if (problem === "missing") await rm(schema);
       else
         await writeFile(
           schema,
-          problem === "invalid JSON" ? "{" : '{"type":"not-a-schema-type"}',
+          problem === "invalid JSON"
+            ? "{"
+            : problem === "async"
+              ? '{"$async":true,"type":"object"}'
+              : '{"type":"not-a-schema-type"}',
         );
-      const resumed = runMultiscan(configured);
+      const recoverScan = mock(async () => undefined);
+      const resumed = runMultiscan({
+        ...configured,
+        ...(recovery ? { recoverScan } : {}),
+      });
       await expect(resumed).rejects.toBeInstanceOf(
         contracts.ContractSchemaError,
       );
       await expect(resumed).rejects.toThrow("coverage.schema.json");
+      expect(createSecurity).toHaveBeenCalledTimes(1);
       expect(run).toHaveBeenCalledTimes(1);
+      expect(recoverScan).not.toHaveBeenCalled();
       expect(await readFile(ledger, "utf8")).toBe(before);
+      expect(await artifactBytes()).toEqual(savedArtifacts);
+      expect(
+        await readdir(join(paths.output, "artifacts", "schema-error")),
+      ).toEqual(["attempt-1"]);
       expect(
         (await readdir(paths.output)).filter(
           (name) => name === ".lock" || name.startsWith(".resume-plugin-"),

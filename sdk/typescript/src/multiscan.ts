@@ -341,12 +341,12 @@ async function runCampaign(
     if (
       receipt.status === "completed" &&
       selectedOutputMatches &&
-      (!artifactsPresent ||
-        !(await hasCompleteContract(
-          artifactOutput,
-          await resumePluginRoot(),
-          options.signal,
-        )))
+      (!(await hasCompleteContract(
+        artifactOutput,
+        await resumePluginRoot(),
+        options.signal,
+      )) ||
+        !artifactsPresent)
     ) {
       rejectedCompleted.add(artifactOutput);
       pending.push(task);
