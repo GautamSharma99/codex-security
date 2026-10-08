@@ -1094,11 +1094,11 @@ async function readReceipts(
       if (!rejectedAttempts.has(id) && !unidentifiedReceipt) continue;
       const requiredAttempt = rejectedAttempts.get(id);
       signal?.throwIfAborted();
-      const retainedScan = receipts.get(id)?.scan;
+      const history = receipts.get(id);
+      const retainedAttempt = history?.scan?.attempt ?? history?.maxAttempt;
       if (
-        retainedScan !== undefined &&
-        (requiredAttempt === undefined ||
-          retainedScan.attempt >= requiredAttempt)
+        retainedAttempt !== undefined &&
+        (requiredAttempt === undefined || retainedAttempt >= requiredAttempt)
       )
         continue;
       const artifactRoot = join(dirname(path), "artifacts", task.id);

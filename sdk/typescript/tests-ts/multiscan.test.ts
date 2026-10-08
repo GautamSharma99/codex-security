@@ -771,6 +771,79 @@ describe("multiscan", () => {
     },
   );
 
+  test("receipt repair retries retained knowledge-only failure history beside unidentified corruption", async () => {
+    const paths = await fixture();
+    const source = await repository(paths.root, "knowledge-retry-source");
+    const knowledgePath = join(paths.root, "knowledge.md");
+    await writeFile(
+      paths.input,
+      `id,repository,revision,mode\nscan,${source.path},${source.revision},standard\nknowledge,${source.path},${source.revision},deep\n`,
+    );
+    const saved = fakeResult();
+    const run = mock<SecurityClient["run"]>(async (_repository, scan = {}) => {
+      await completedScan(scan.outputDir!);
+      return saved;
+    });
+    const configured = options(paths, client(run), {
+      maxAttempts: 1,
+      scanOptionsByMode: { deep: { knowledgeBasePaths: [knowledgePath] } },
+    });
+    const initial = await runMultiscan(configured);
+    expect(initial).toMatchObject({ completed: 1, failed: 1 });
+    const lines = (await readFile(initial.resultsPath, "utf8"))
+      .trimEnd()
+      .split("\n");
+    const retainedLine = lines.find(
+      (line) => JSON.parse(line).id === "knowledge",
+    )!;
+    expect(JSON.parse(retainedLine)).toMatchObject({
+      attempt: 1,
+      knowledgeBaseFailure: true,
+      status: "failed",
+    });
+    expect(await readdir(join(paths.output, "artifacts", "knowledge"))).toEqual(
+      [],
+    );
+    const scanDir = join(paths.output, "artifacts", "scan", "attempt-1");
+    const report = await readFile(join(scanDir, "report.md"));
+    await writeFile(knowledgePath, "Synthetic restored knowledge.\n");
+    const retained = Buffer.from(`${retainedLine}\n`);
+    const damaged = Buffer.concat([Buffer.from("{broken}\n"), retained]);
+    await writeFile(initial.resultsPath, damaged);
+    const recoverScan = mock(async (path: string) => {
+      expect(path).toBe(scanDir);
+      return saved;
+    });
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 2,
+      failed: 0,
+      skipped: 0,
+    });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(recoverScan).toHaveBeenCalledTimes(1);
+    expect(
+      (await results(initial.resultsPath)).findLast(
+        (row) => row["id"] === "knowledge",
+      ),
+    ).toMatchObject({ attempt: 2, status: "completed" });
+    expect(
+      (await readFile(initial.resultsPath)).subarray(0, retained.length),
+    ).toEqual(retained);
+    expect(await readFile(join(scanDir, "report.md"))).toEqual(report);
+    const backups = (await readdir(paths.output)).filter((name) =>
+      name.startsWith("results.corrupt-"),
+    );
+    expect(backups).toHaveLength(1);
+    expect(await readFile(join(paths.output, backups[0]!))).toEqual(damaged);
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 2,
+      failed: 0,
+      skipped: 2,
+    });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(recoverScan).toHaveBeenCalledTimes(1);
+  });
+
   test("receipt repair retains incomplete coverage and knowledge-failure history", async () => {
     const { paths } = await repositoryFixture("retained-history");
     const run = mock<SecurityClient["run"]>(async (_repository, scan = {}) => {
