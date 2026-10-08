@@ -572,6 +572,142 @@ describe("multiscan", () => {
     },
   );
 
+  test.each([
+    ["invalid output path", { outputDir: 42 }],
+    ["invalid warnings", { warnings: {} }],
+    ["invalid JSON", undefined],
+  ] as const)(
+    "refuses repair when discarded checkout-failure history has no saved attempt (%s)",
+    async (_name, corruption) => {
+      const paths = await fixture();
+      await writeFile(
+        paths.input,
+        `id,repository,revision\nrepo,${join(paths.root, "absent-repository")},${"a".repeat(40)}\n`,
+      );
+      const run = mock(rejecting("Unexpected model scan"));
+      const configured = options(paths, client(run), { maxAttempts: 1 });
+      const initial = await runMultiscan(configured);
+      expect(initial).toMatchObject({ failed: 1, skipped: 0 });
+      const artifactRoot = join(paths.output, "artifacts", "repo");
+      expect(await readdir(artifactRoot)).toEqual([]);
+      const [receipt] = await results(initial.resultsPath);
+      const damaged = Buffer.from(
+        corruption === undefined
+          ? "{broken}\n"
+          : `${JSON.stringify({ ...receipt, ...corruption })}\n`,
+      );
+      await writeFile(initial.resultsPath, damaged);
+      await expect(runMultiscan(configured)).rejects.toThrow(
+        "invalid campaign receipt",
+      );
+      expect(await readFile(initial.resultsPath)).toEqual(damaged);
+      const recoverScan = mock(async () => undefined);
+      for (let repeat = 0; repeat < 2; repeat++) {
+        await expect(
+          runMultiscan({ ...configured, recoverScan }),
+        ).rejects.toThrow("Repair the ledger manually");
+        expect(await readFile(initial.resultsPath)).toEqual(damaged);
+        expect(await readdir(artifactRoot)).toEqual([]);
+      }
+      expect(run).not.toHaveBeenCalled();
+      expect(recoverScan).not.toHaveBeenCalled();
+      const names = await readdir(paths.output);
+      const backups = names.filter((name) =>
+        name.startsWith("results.corrupt-"),
+      );
+      expect(backups).toHaveLength(2);
+      for (const backup of backups)
+        expect(await readFile(join(paths.output, backup))).toEqual(damaged);
+      expect(
+        names.filter(
+          (name) => name === ".lock" || name.startsWith(".results.repair-"),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  test("refuses repair when a damaged newer attempt would expose an older completion", async () => {
+    const { paths } = await repositoryFixture("unresolved-newer-attempt");
+    const run = mock(completeRun);
+    const configured = options(paths, client(run));
+    const initial = await runMultiscan(configured);
+    const original = await readFile(initial.resultsPath);
+    const [receipt] = await results(initial.resultsPath);
+    const scanDir = receipt!["outputDir"] as string;
+    const report = await readFile(join(scanDir, "report.md"));
+    const damaged = Buffer.concat([
+      original,
+      Buffer.from(
+        `${JSON.stringify({
+          ...receipt,
+          attempt: 2,
+          status: "failed",
+          outputDir: join(
+            paths.output,
+            "artifacts",
+            "unresolved-newer-attempt",
+            "attempt-2",
+          ),
+          error: "Synthetic checkout failure",
+          warnings: {},
+        })}\n`,
+      ),
+    ]);
+    await writeFile(initial.resultsPath, damaged);
+    const recoverScan = mock(async () => undefined);
+    for (let repeat = 0; repeat < 2; repeat++) {
+      await expect(
+        runMultiscan({ ...configured, recoverScan }),
+      ).rejects.toThrow(
+        "no retained scan receipt or saved attempt artifacts reach attempt 2",
+      );
+      expect(await readFile(initial.resultsPath)).toEqual(damaged);
+      expect(await readFile(join(scanDir, "report.md"))).toEqual(report);
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(recoverScan).not.toHaveBeenCalled();
+  });
+
+  test("repairs unidentified history when the attempted scan remains on disk", async () => {
+    const { paths } = await repositoryFixture(
+      "recoverable-unidentified-history",
+    );
+    const saved = fakeResult();
+    const run = mock<SecurityClient["run"]>(async (_repository, scan = {}) => {
+      await completedScan(scan.outputDir!);
+      return saved;
+    });
+    const configured = options(paths, client(run));
+    const initial = await runMultiscan(configured);
+    const [receipt] = await results(initial.resultsPath);
+    const scanDir = receipt!["outputDir"] as string;
+    const report = await readFile(join(scanDir, "report.md"));
+    const damaged = Buffer.from("{broken}\n");
+    await writeFile(initial.resultsPath, damaged);
+    const recoverScan = mock(async (path: string) => {
+      expect(path).toBe(scanDir);
+      return saved;
+    });
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 1,
+      skipped: 0,
+      failed: 0,
+    });
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 1,
+      skipped: 1,
+      failed: 0,
+    });
+    expect(recoverScan).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(await readFile(join(scanDir, "report.md"))).toEqual(report);
+    const backups = (await readdir(paths.output)).filter((name) =>
+      name.startsWith("results.corrupt-"),
+    );
+    expect(backups).toHaveLength(1);
+    expect(await readFile(join(paths.output, backups[0]!))).toEqual(damaged);
+  });
+
   test.each([false, true])(
     "recovery finds newer attempts beside unaffected completions with ledger repair=%p",
     async (repair) => {

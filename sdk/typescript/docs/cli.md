@@ -710,6 +710,11 @@ number and recovery guidance. With `--recover`, the original ledger is saved as
 `results.corrupt-<uuid>.jsonl` before usable records replace the active ledger.
 Completed rows stay skipped unless a newer attempt exists on disk; that attempt
 uses the same recovery process above. Original scan artifacts remain available.
+If damaged records leave attempted work without a retained receipt or saved
+attempt to recover, repair stops with an error and leaves the active ledger
+unchanged. This also applies when a record cannot be identified and a repository
+has no remaining history. Use the preserved backup to repair the ledger manually
+before retrying recovery; missing history is not classified as never started.
 
 New attempts use `recovery-checkouts/<id>/attempt-<n>`. Recovery defaults to four
 workers and one recovery/new attempt per repository. A resume connection failure

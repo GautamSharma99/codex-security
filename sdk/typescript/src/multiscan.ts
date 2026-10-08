@@ -260,6 +260,7 @@ async function runCampaign(
   );
   const receipts = await readReceipts(
     ledger,
+    tasks,
     options.recoverScan !== undefined,
     options.signal,
   );
@@ -1009,6 +1010,7 @@ async function ensureManifest(
 
 async function readReceipts(
   path: string,
+  tasks: readonly MultiscanTask[],
   recover = false,
   signal?: AbortSignal,
 ): Promise<Map<string, MultiscanHistory>> {
@@ -1022,6 +1024,9 @@ async function readReceipts(
   }
   const committedEnd = contents.lastIndexOf(0x0a) + 1;
   const retained: Buffer[] = [];
+  const tasksById = new Map(tasks.map((task) => [task.id.toLowerCase(), task]));
+  const rejectedAttempts = new Map<string, number | undefined>();
+  let unidentifiedReceipt = false;
   let repaired = false;
   let lineNumber = 0;
   const receipts = new Map<string, MultiscanHistory>();
@@ -1035,15 +1040,36 @@ async function readReceipts(
       retained.push(line);
       continue;
     }
+    let value: unknown;
     let receipt: MultiscanReceipt;
     try {
-      receipt = parseMultiscanReceipt(line.toString("utf8"));
+      value = JSON.parse(line.toString("utf8"));
+      receipt = parseMultiscanReceipt(value);
     } catch (error) {
       if (!recover)
         throw new Error(
           `${path}:${lineNumber}: invalid campaign receipt: ${errorMessage(error)}. Rerun with --recover to preserve the damaged ledger and recover saved attempts.`,
           { cause: error },
         );
+      const id =
+        isRecord(value) && typeof value["id"] === "string"
+          ? value["id"].toLowerCase()
+          : undefined;
+      if (id !== undefined && tasksById.has(id)) {
+        const attempt =
+          isRecord(value) &&
+          Number.isSafeInteger(value["attempt"]) &&
+          (value["attempt"] as number) > 0
+            ? (value["attempt"] as number)
+            : undefined;
+        const previous = rejectedAttempts.get(id);
+        rejectedAttempts.set(
+          id,
+          attempt === undefined ? previous : Math.max(previous ?? 0, attempt),
+        );
+      } else {
+        unidentifiedReceipt = true;
+      }
       repaired = true;
       continue;
     }
@@ -1064,6 +1090,38 @@ async function readReceipts(
       `.results.repair-${randomUUID()}.jsonl`,
     );
     await writeReceiptRepair(backup, contents);
+    for (const [id, task] of tasksById) {
+      if (!rejectedAttempts.has(id) && !unidentifiedReceipt) continue;
+      const requiredAttempt = rejectedAttempts.get(id);
+      signal?.throwIfAborted();
+      const retainedScan = receipts.get(id)?.scan;
+      if (
+        retainedScan !== undefined &&
+        (requiredAttempt === undefined ||
+          retainedScan.attempt >= requiredAttempt)
+      )
+        continue;
+      const artifactRoot = join(dirname(path), "artifacts", task.id);
+      const existing = await lstat(artifactRoot).catch(undefinedIfMissingFile);
+      const savedAttempt =
+        existing === undefined
+          ? 0
+          : await latestArtifactAttempt(
+              await ensureOutputDirectory(artifactRoot),
+            );
+      if (
+        savedAttempt > 0 &&
+        (requiredAttempt === undefined || savedAttempt >= requiredAttempt)
+      )
+        continue;
+      const missing =
+        requiredAttempt === undefined
+          ? "no retained scan receipt or saved attempt artifacts identify its work"
+          : `no retained scan receipt or saved attempt artifacts reach attempt ${requiredAttempt}`;
+      throw new Error(
+        `Cannot repair ${path}: unresolved attempted history for ${task.id}; ${missing}. The active ledger is unchanged. Repair the ledger manually using the original bytes in ${backup} before retrying recovery.`,
+      );
+    }
     try {
       await writeReceiptRepair(replacement, Buffer.concat(retained));
       signal?.throwIfAborted();
@@ -1085,8 +1143,7 @@ async function readReceipts(
   return receipts;
 }
 
-function parseMultiscanReceipt(line: string): MultiscanReceipt {
-  const value: unknown = JSON.parse(line);
+function parseMultiscanReceipt(value: unknown): MultiscanReceipt {
   if (
     !isRecord(value) ||
     typeof value["id"] !== "string" ||
