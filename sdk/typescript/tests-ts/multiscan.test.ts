@@ -771,6 +771,162 @@ describe("multiscan", () => {
     },
   );
 
+  test.each(["resume", "fresh", "missing scan", "mixed saved scan"] as const)(
+    "receipt repair distinguishes discarded extraction attempts from scan work (%s)",
+    async (scenario) => {
+      const { paths, source } = await repositoryFixture(
+        "mixed-attempt-history",
+      );
+      const knowledgePath = join(paths.root, "context.md");
+      const knowledge = "Synthetic knowledge for recovery.\n";
+      await writeFile(knowledgePath, knowledge);
+      let runCalls = 0;
+      const saved = fakeResult();
+      const run = mock<SecurityClient["run"]>(
+        async (_repository, scan = {}) => {
+          runCalls++;
+          if (
+            runCalls === 1 ||
+            (scenario === "mixed saved scan" && runCalls === 2)
+          ) {
+            await mkdir(scan.outputDir!, { recursive: true, mode: 0o700 });
+            await writeFile(
+              join(scan.outputDir!, "checkpoint"),
+              "Synthetic interrupted scan.\n",
+            );
+            throw new Error("Synthetic interrupted scan");
+          }
+          expect(scan.outputDir).toBe(
+            join(
+              paths.output,
+              "artifacts",
+              "mixed-attempt-history",
+              "attempt-4",
+            ),
+          );
+          await completedScan(scan.outputDir!);
+          return saved;
+        },
+      );
+      const configured = options(paths, client(run), {
+        maxAttempts: 1,
+        knowledgeBasePaths: [knowledgePath],
+      });
+      const initial = await runMultiscan(configured);
+      expect(initial.failed).toBe(1);
+      if (scenario === "missing scan") {
+        const movedSource = join(paths.root, "temporarily-moved-source");
+        await rename(source.path, movedSource);
+        expect((await runMultiscan(configured)).failed).toBe(1);
+        await rename(movedSource, source.path);
+      } else if (scenario === "mixed saved scan") {
+        expect((await runMultiscan(configured)).failed).toBe(1);
+      } else {
+        await rm(knowledgePath);
+        expect((await runMultiscan(configured)).failed).toBe(1);
+      }
+      await rm(knowledgePath, { force: true });
+      expect((await runMultiscan(configured)).failed).toBe(1);
+      if (scenario === "missing scan" || scenario === "mixed saved scan")
+        expect((await runMultiscan(configured)).failed).toBe(1);
+      const lines = (await readFile(initial.resultsPath, "utf8"))
+        .trimEnd()
+        .split("\n");
+      const rows = lines.map(
+        (line) => JSON.parse(line) as Record<string, unknown>,
+      );
+      expect(
+        rows.map((row) => ({
+          attempt: row["attempt"],
+          knowledge: row["knowledgeBaseFailure"] === true,
+        })),
+      ).toEqual([
+        { attempt: 1, knowledge: false },
+        {
+          attempt: 2,
+          knowledge: scenario === "resume" || scenario === "fresh",
+        },
+        { attempt: 3, knowledge: true },
+        ...(scenario === "missing scan" || scenario === "mixed saved scan"
+          ? [{ attempt: 4, knowledge: true }]
+          : []),
+      ]);
+      const artifactRoot = join(
+        paths.output,
+        "artifacts",
+        "mixed-attempt-history",
+      );
+      expect((await readdir(artifactRoot)).sort()).toEqual(
+        scenario === "mixed saved scan"
+          ? ["attempt-1", "attempt-2"]
+          : ["attempt-1"],
+      );
+      const scanDir = join(
+        artifactRoot,
+        scenario === "mixed saved scan" ? "attempt-2" : "attempt-1",
+      );
+      const checkpoint = await readFile(join(scanDir, "checkpoint"));
+      const rejected =
+        scenario === "missing scan" || scenario === "mixed saved scan"
+          ? [1, 2]
+          : [1];
+      for (const index of rejected)
+        rows[index]!["warnings"] = "Synthetic malformed warnings";
+      const damaged = Buffer.from(
+        rows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+      );
+      await writeFile(initial.resultsPath, damaged);
+      await writeFile(knowledgePath, knowledge);
+      const recoverScan = mock(async (path: string) => {
+        expect(path).toBe(scanDir);
+        if (scenario === "fresh") return undefined;
+        await completedScan(path);
+        return saved;
+      });
+      if (scenario === "missing scan") {
+        for (let repeat = 0; repeat < 2; repeat++) {
+          await expect(
+            runMultiscan({ ...configured, recoverScan }),
+          ).rejects.toThrow("unresolved attempted history");
+          expect(await readFile(initial.resultsPath)).toEqual(damaged);
+        }
+        expect(recoverScan).not.toHaveBeenCalled();
+        expect(run).toHaveBeenCalledTimes(1);
+      } else {
+        expect(
+          await runMultiscan({ ...configured, recoverScan }),
+        ).toMatchObject({ completed: 1, failed: 0, skipped: 0 });
+        expect(recoverScan).toHaveBeenCalledTimes(1);
+        expect(run).toHaveBeenCalledTimes(
+          scenario === "fresh" || scenario === "mixed saved scan" ? 2 : 1,
+        );
+        const retained = Buffer.from(
+          lines.filter((_line, index) => !rejected.includes(index)).join("\n") +
+            "\n",
+        );
+        expect(
+          (await readFile(initial.resultsPath)).subarray(0, retained.length),
+        ).toEqual(retained);
+        expect((await results(initial.resultsPath)).at(-1)).toMatchObject({
+          attempt:
+            scenario === "fresh" ? 4 : scenario === "mixed saved scan" ? 2 : 1,
+          status: "completed",
+        });
+        expect(
+          await runMultiscan({ ...configured, recoverScan }),
+        ).toMatchObject({ completed: 1, failed: 0, skipped: 1 });
+        expect(recoverScan).toHaveBeenCalledTimes(1);
+      }
+      expect(await readFile(join(scanDir, "checkpoint"))).toEqual(checkpoint);
+      const backups = (await readdir(paths.output)).filter((name) =>
+        name.startsWith("results.corrupt-"),
+      );
+      expect(backups).toHaveLength(scenario === "missing scan" ? 2 : 1);
+      for (const backup of backups)
+        expect(await readFile(join(paths.output, backup))).toEqual(damaged);
+    },
+  );
+
   test("receipt repair retries retained knowledge-only failure history beside unidentified corruption", async () => {
     const paths = await fixture();
     const source = await repository(paths.root, "knowledge-retry-source");

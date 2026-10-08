@@ -1026,6 +1026,7 @@ async function readReceipts(
   const retained: Buffer[] = [];
   const tasksById = new Map(tasks.map((task) => [task.id.toLowerCase(), task]));
   const rejectedAttempts = new Map<string, number | undefined>();
+  const rejectedKnowledgeAttempts = new Map<string, number | undefined>();
   let unidentifiedReceipt = false;
   let repaired = false;
   let lineNumber = 0;
@@ -1062,8 +1063,12 @@ async function readReceipts(
           (value["attempt"] as number) > 0
             ? (value["attempt"] as number)
             : undefined;
-        const previous = rejectedAttempts.get(id);
-        rejectedAttempts.set(
+        const rejected =
+          isRecord(value) && value["knowledgeBaseFailure"] === true
+            ? rejectedKnowledgeAttempts
+            : rejectedAttempts;
+        const previous = rejected.get(id);
+        rejected.set(
           id,
           attempt === undefined ? previous : Math.max(previous ?? 0, attempt),
         );
@@ -1091,16 +1096,19 @@ async function readReceipts(
     );
     await writeReceiptRepair(backup, contents);
     for (const [id, task] of tasksById) {
-      if (!rejectedAttempts.has(id) && !unidentifiedReceipt) continue;
       const requiredAttempt = rejectedAttempts.get(id);
+      const requiredKnowledgeAttempt = rejectedKnowledgeAttempts.get(id);
       signal?.throwIfAborted();
       const history = receipts.get(id);
-      const retainedAttempt = history?.scan?.attempt ?? history?.maxAttempt;
-      if (
-        retainedAttempt !== undefined &&
-        (requiredAttempt === undefined || retainedAttempt >= requiredAttempt)
-      )
-        continue;
+      const retainedScan =
+        !rejectedAttempts.has(id) ||
+        includesAttempt(history?.scan?.attempt, requiredAttempt);
+      const retainedKnowledge =
+        !rejectedKnowledgeAttempts.has(id) ||
+        includesAttempt(history?.maxAttempt, requiredKnowledgeAttempt);
+      const retainedUnidentified =
+        !unidentifiedReceipt || history !== undefined;
+      if (retainedScan && retainedKnowledge && retainedUnidentified) continue;
       const artifactRoot = join(dirname(path), "artifacts", task.id);
       const existing = await lstat(artifactRoot).catch(undefinedIfMissingFile);
       const savedAttempt =
@@ -1109,15 +1117,23 @@ async function readReceipts(
           : await latestArtifactAttempt(
               await ensureOutputDirectory(artifactRoot),
             );
-      if (
-        savedAttempt > 0 &&
-        (requiredAttempt === undefined || savedAttempt >= requiredAttempt)
-      )
-        continue;
+      const missingScan =
+        !retainedScan && !includesAttempt(savedAttempt, requiredAttempt);
+      const missingKnowledge =
+        !retainedKnowledge &&
+        !includesAttempt(savedAttempt, requiredKnowledgeAttempt);
+      const missingUnidentified = !retainedUnidentified && savedAttempt === 0;
+      if (!missingScan && !missingKnowledge && !missingUnidentified) continue;
+      const required = missingScan
+        ? requiredAttempt
+        : missingKnowledge
+          ? requiredKnowledgeAttempt
+          : undefined;
+      const evidence = missingScan ? "scan receipt" : "attempt history";
       const missing =
-        requiredAttempt === undefined
-          ? "no retained scan receipt or saved attempt artifacts identify its work"
-          : `no retained scan receipt or saved attempt artifacts reach attempt ${requiredAttempt}`;
+        required === undefined
+          ? `no retained ${evidence} or saved attempt artifacts identify its work`
+          : `no retained ${evidence} or saved attempt artifacts reach attempt ${required}`;
       throw new Error(
         `Cannot repair ${path}: unresolved attempted history for ${task.id}; ${missing}. The active ledger is unchanged. Repair the ledger manually using the original bytes in ${backup} before retrying recovery.`,
       );
@@ -1184,6 +1200,17 @@ async function writeReceiptRepair(
   } finally {
     await file.close();
   }
+}
+
+function includesAttempt(
+  latest: number | undefined,
+  required: number | undefined,
+): boolean {
+  return (
+    latest !== undefined &&
+    latest > 0 &&
+    (required === undefined || latest >= required)
+  );
 }
 
 async function latestArtifactAttempt(path: string): Promise<number> {
