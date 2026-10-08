@@ -1001,6 +1001,69 @@ describe("multiscan", () => {
     },
   );
 
+  test("repairs malformed receipt policy state without losing the requested severity outcome", async () => {
+    const { paths } = await repositoryFixture("receipt-policy");
+    const saved = fakeResult(["high"]);
+    const run = mock<SecurityClient["run"]>(async (_repository, scan = {}) => {
+      await completedScan(scan.outputDir!);
+      return saved;
+    });
+    const configured = options(paths, client(run), {
+      scanOptionsByMode: { standard: { failureSeverity: "high" } },
+    });
+    const initial = await runMultiscan(configured);
+    expect(initial.policyFailed).toBe(true);
+    const [receipt] = await results(initial.resultsPath);
+    const scanDir = receipt!["outputDir"] as string;
+    const report = await readFile(join(scanDir, "report.md"));
+    const recoverScan = mock(async (path: string) => {
+      expect(path).toBe(scanDir);
+      return saved;
+    });
+
+    const { policyFailed: _policy, ...legacy } = receipt!;
+    await writeFile(initial.resultsPath, `${JSON.stringify(legacy)}\n`);
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 1,
+      skipped: 1,
+      policyFailed: false,
+    });
+    expect(recoverScan).not.toHaveBeenCalled();
+
+    const damaged = Buffer.from(
+      `${JSON.stringify({ ...receipt, policyFailed: "true" })}\n`,
+    );
+    await writeFile(initial.resultsPath, damaged);
+    await expect(runMultiscan(configured)).rejects.toThrow(
+      "invalid campaign receipt",
+    );
+    expect(await readFile(initial.resultsPath)).toEqual(damaged);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    expect(await runMultiscan({ ...configured, recoverScan })).toMatchObject({
+      completed: 1,
+      skipped: 0,
+      failed: 0,
+      policyFailed: true,
+    });
+    expect(recoverScan).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(await readFile(join(scanDir, "report.md"))).toEqual(report);
+    const backups = (await readdir(paths.output)).filter((name) =>
+      name.startsWith("results.corrupt-"),
+    );
+    expect(backups).toHaveLength(1);
+    expect(await readFile(join(paths.output, backups[0]!))).toEqual(damaged);
+    expect((await results(initial.resultsPath)).at(-1)?.["policyFailed"]).toBe(
+      true,
+    );
+    expect(await runMultiscan(configured)).toMatchObject({
+      completed: 1,
+      skipped: 1,
+      policyFailed: true,
+    });
+  });
+
   test("bulk recovery requires an existing campaign and a CSV", async () => {
     const { paths } = await repositoryFixture("missing-campaign", "repo");
     for (const args of [

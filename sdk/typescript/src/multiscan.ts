@@ -1102,6 +1102,8 @@ function parseMultiscanReceipt(line: string): MultiscanReceipt {
       (!Array.isArray(value["warnings"]) ||
         !value["warnings"].every((warning) => typeof warning === "string"))) ||
     (value["warning"] !== undefined && typeof value["warning"] !== "string") ||
+    (value["policyFailed"] !== undefined &&
+      typeof value["policyFailed"] !== "boolean") ||
     (value["coverage"] !== undefined &&
       !["complete", "partial", "unknown"].includes(
         value["coverage"] as string,
