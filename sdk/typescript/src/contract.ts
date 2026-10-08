@@ -1019,7 +1019,7 @@ async function loadContractValidators(
     });
     try {
       const validate = ajv.compile(schema);
-      if (validate.$async) {
+      if ("$async" in validate && validate.$async === true) {
         throw new Error("asynchronous JSON Schema validation is unsupported");
       }
       validators.push({ filename, schemaName, validate });
