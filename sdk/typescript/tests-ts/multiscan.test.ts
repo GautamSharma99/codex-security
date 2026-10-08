@@ -115,8 +115,9 @@ async function completedScan(
   completeness: "complete" | "partial" | "unknown" = "complete",
 ): Promise<ScanResult> {
   await mkdir(outputDir, { recursive: true, mode: 0o700 });
+  await chmod(outputDir, 0o700);
   await copyCompletedScanFixture(outputDir);
-  await writeFile(join(outputDir, "report.md"), "# Scan report\n");
+  await writeFile(join(outputDir, "report.md"), "{}\n");
   if (completeness !== "complete") {
     const coveragePath = join(outputDir, "coverage.json");
     const coverage = JSON.parse(await readFile(coveragePath, "utf8"));
@@ -156,7 +157,7 @@ async function customPlugin(
   const coverage = JSON.parse(
     Buffer.from(files["schemas/coverage.schema.json"]!).toString("utf8"),
   );
-  coverage.properties.customMarker = { const: true };
+  coverage.properties.schemaVersion = { enum: ["1.0", "custom-test"] };
   files["schemas/coverage.schema.json"] = Buffer.from(JSON.stringify(coverage));
   const path = join(root, format === "zip" ? "plugin.zip" : "plugin");
   if (format === "zip") {
@@ -2195,7 +2196,7 @@ describe("multiscan", () => {
       const scanDir = receipt!["outputDir"] as string;
       const coveragePath = join(scanDir, "coverage.json");
       const coverage = JSON.parse(await readFile(coveragePath, "utf8"));
-      coverage.customMarker = true;
+      coverage.schemaVersion = "custom-test";
       await writeFile(coveragePath, `${JSON.stringify(coverage, null, 2)}\n`);
       await reseal(scanDir);
       await expect(
