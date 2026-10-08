@@ -190,6 +190,7 @@ describe("TypeScript package skeleton", () => {
       "validate-title",
       "static-checks",
       "plugin-host",
+      "plugin-source",
       "windows-test",
       "windows-verify",
     ]);
@@ -220,9 +221,56 @@ describe("TypeScript package skeleton", () => {
     expect(packageJson.scripts["test:ci"]).toContain("pnpm run test ");
     expect(jobs["windows-test"]?.steps).toContainEqual(
       expect.objectContaining({
-        run: "node sdk/typescript/scripts/run-ci-tests.mjs ${{ matrix.shard }}/7",
+        run: "node --experimental-strip-types sdk/typescript/scripts/run-ci-tests.mts ${{ matrix.shard }}/7",
       }),
     );
+  });
+
+  test("covers the Python runtime floor and native platform paths", async () => {
+    const { jobs } = await workflow("node-ci.yml");
+    const job = jobs["plugin-source"]!;
+    expect(job.strategy?.matrix["include"]).toEqual([
+      ...["3.10", "3.12", "3.14"].map((python) => ({
+        os: "ubuntu-latest",
+        python,
+        markers: "",
+      })),
+      {
+        os: "macos-latest",
+        python: "3.12",
+        markers: "cross_platform or native_macos",
+      },
+      {
+        os: "windows-latest",
+        python: "3.12",
+        markers: "cross_platform or native_windows",
+      },
+    ]);
+    const testStep = job.steps!.find(
+      ({ name }) => name === "Test Python source contracts",
+    )!;
+    expect(testStep.env?.["PYTEST_MARKERS"]).toBe("${{ matrix.markers }}");
+    expect(testStep.run).toContain(
+      'python -m pytest plugins/codex-security/tests -m "$PYTEST_MARKERS"',
+    );
+    expect(testStep).not.toHaveProperty("if");
+    expect(testStep).not.toHaveProperty("continue-on-error");
+    const nativeCoverageStep = job.steps!.find(
+      ({ name }) => name === "Require native platform coverage",
+    )!;
+    expect(nativeCoverageStep.if).toBe("runner.os != 'Linux'");
+    expect(nativeCoverageStep.run).toContain(".//testcase/skipped");
+    expect(nativeCoverageStep).not.toHaveProperty("continue-on-error");
+    for (const name of [
+      "Install plugin dependencies",
+      "Build SDK and type-check eval tooling",
+    ]) {
+      expect(job.steps!.find((step) => step.name === name)?.if).toBe(
+        "matrix.os == 'ubuntu-latest' && matrix.python == '3.12'",
+      );
+    }
+    expect(jobs["required-test"]?.needs).toContain("plugin-source");
+    expect(jobs["windows"]?.needs).toContain("plugin-source");
   });
 
   test("checks one archive and restores its plugin before every test shard", async () => {
@@ -297,8 +345,9 @@ describe("TypeScript package skeleton", () => {
       ["Check formatting", "static-checks"],
       ["Check MCP formatting", "static-checks"],
     ] as const) {
-      expect(steps.filter((step) => step.name === name)).toHaveLength(1);
-      expect(jobs[job]!.steps!.some((step) => step.name === name)).toBe(true);
+      expect(
+        jobs[job]!.steps!.filter((step) => step.name === name),
+      ).toHaveLength(1);
     }
     for (const name of [
       "Upload test reports",

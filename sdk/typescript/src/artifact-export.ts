@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Writable as NodeWritable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -107,6 +107,7 @@ export async function runArtifactHelper(
       "-I",
       "-X",
       "utf8",
+      "-B",
       join(plugin, "scripts", "finalize_scan_contract.py"),
       ...args,
     ],
@@ -119,8 +120,9 @@ export async function runArtifactHelper(
   );
   let stderr = "";
   let stdout = "";
-  invocation.stderr.on("data", (chunk: Buffer) => {
-    stderr = `${stderr}${chunk.toString("utf8")}`.slice(-64 * 1024);
+  invocation.stderr.setEncoding("utf8");
+  invocation.stderr.on("data", (chunk: string) => {
+    stderr = `${stderr}${chunk}`.slice(-64 * 1024);
   });
   const forwarded =
     options.output === undefined
@@ -262,13 +264,39 @@ export async function resolveArtifactExportOutput(
           );
   if (arguments_.output !== "-") {
     const outputFromCurrent = relative(currentDirectory, arguments_.output);
-    if (!isOutsidePath(outputFromCurrent)) {
+    if (outputFromCurrent !== "" && !isOutsidePath(outputFromCurrent)) {
+      let existingParent: string | undefined;
+      for (
+        let directory = dirname(arguments_.output);
+        relative(currentDirectory, directory) !== "";
+        directory = dirname(directory)
+      ) {
+        const metadata = await lstat(directory).catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return undefined;
+            throw error;
+          },
+        );
+        if (metadata?.isSymbolicLink()) {
+          throw new CodexSecurityError(
+            "The export output path cannot traverse a repository symlink.",
+          );
+        }
+        if (metadata !== undefined) existingParent ??= directory;
+      }
       const canonicalCurrent = await realpath(currentDirectory).catch(
         () => currentDirectory,
       );
+      const expectedOutput =
+        existingParent === undefined
+          ? resolve(canonicalCurrent, outputFromCurrent)
+          : resolve(
+              await realpath(existingParent),
+              relative(existingParent, arguments_.output),
+            );
       if (
-        relative(resolve(canonicalCurrent, outputFromCurrent), outputPath) !==
-        ""
+        isOutsidePath(relative(canonicalCurrent, outputPath)) ||
+        relative(expectedOutput, outputPath) !== ""
       ) {
         throw new CodexSecurityError(
           "The export output path cannot traverse a repository symlink.",

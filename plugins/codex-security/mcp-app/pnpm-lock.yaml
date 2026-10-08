@@ -9,11 +9,14 @@ importers:
   .:
     dependencies:
       '@modelcontextprotocol/sdk':
-        specifier: ^1.30.1
-        version: 1.30.1(zod@4.6.5)
+        specifier: ^1.31.0
+        version: 1.31.0(zod@4.6.5)
       '@openai/codex-sdk':
-        specifier: 0.162.0-alpha.12
-        version: 0.162.0-alpha.12
+        specifier: 0.162.0-alpha.18
+        version: 0.162.0-alpha.18
+      ajv:
+        specifier: 8.20.0
+        version: 8.20.0
       smol-toml:
         specifier: 1.9.0
         version: 1.9.0
@@ -198,8 +201,8 @@ packages:
     peerDependencies:
       hono: ^4
 
-  '@modelcontextprotocol/sdk@1.30.1':
-    resolution: {integrity: sha512-H2HxLvC3HDNybePJaLdSrU1hhUK5iQw+WvV1b01myFyI7sdVGe1u/IPTE5D9fGCiJDVtgMV/lmFkQXLmQyIFYA==}
+  '@modelcontextprotocol/sdk@1.31.0':
+    resolution: {integrity: sha512-UvTMgnNlnIBO/22ob2RcVGDlcvOslQs8T59+FTGdA0L27a39fdGF/EDETNtDVK4DZGpwomlsYpRdA8UXcVL/pw==}
     engines: {node: '>=18'}
     peerDependencies:
       '@cfworker/json-schema': ^4.1.1
@@ -208,47 +211,47 @@ packages:
       '@cfworker/json-schema':
         optional: true
 
-  '@openai/codex-sdk@0.162.0-alpha.12':
-    resolution: {integrity: sha512-fsAxAnL4VH2qz7q1fKdV3lZKbjrlASUVJNSIkMBMZQi0Kl2/1T5idHqixAywB4FJFFqUMJkLgv/CFIcRNyrhSA==}
+  '@openai/codex-sdk@0.162.0-alpha.18':
+    resolution: {integrity: sha512-qGx0UiX6+RSZstq/NLpErFUULWBfWUIUBHXFoMnj0BD6NBZM0OZBl7Ebli0MrmcgMGCBtF9uVGELCd//TBJI+A==}
     engines: {node: '>=18'}
 
-  '@openai/codex@0.162.0-alpha.12':
-    resolution: {integrity: sha512-JeuyG5ME0PVZdan9T44qqG1e9BO81PL5MvT5ruD/bV0GehiIngb8WY6qJECT5I9js8+OJz8eKbqvXb+kHCmoJg==}
+  '@openai/codex@0.162.0-alpha.18':
+    resolution: {integrity: sha512-s2aYiQrW0hGFfHvP6jDnnkasPUzgWlOPjKfI56FwfSWrB8ezBZjq5/5Ur5ukR0EoAA0mi/mNO/KZprjJaNHOnA==}
     engines: {node: '>=16'}
     hasBin: true
 
-  '@openai/codex@0.162.0-alpha.12-darwin-arm64':
-    resolution: {integrity: sha512-BaoK4rHMC+fU7Vg+rb4bIsIWL6hzQs0/mpa3E0O9Tl8du7kbChVtC/+Wwzf1fE7KIOasXESASS+stZjW6/N8Qg==}
+  '@openai/codex@0.162.0-alpha.18-darwin-arm64':
+    resolution: {integrity: sha512-KIYefVbXLG3cvbDsSn/aC6upFIUgw6Zq5Q0O+xfKjob7+7iUgGFLGvzx2dHvKRSQj5eeVAC1UELo8q4fwcJvVw==}
     engines: {node: '>=16'}
     cpu: [arm64]
     os: [darwin]
 
-  '@openai/codex@0.162.0-alpha.12-darwin-x64':
-    resolution: {integrity: sha512-CQgaAnNDO56IzXvHxsOEnM8/bKdWuwftAlS141dO/HAjA2LTe5cRiKPki1HPyZ5WIBMGI4hSnX6cEeMEvkw93g==}
+  '@openai/codex@0.162.0-alpha.18-darwin-x64':
+    resolution: {integrity: sha512-9gTWSdFmTQIYup1DPwUK1HQPuiuwiB4fg8tHXe9UpoBS/RHlfTBmt11bf+0sCoxfC/gyIA02Akh9il8gHTpVcw==}
     engines: {node: '>=16'}
     cpu: [x64]
     os: [darwin]
 
-  '@openai/codex@0.162.0-alpha.12-linux-arm64':
-    resolution: {integrity: sha512-yphh+e3zoUbt91F+mt/x1AK6qV+yJfENkamikkQMWA5YVPpqqVgmvaKFBNW/wwGIw0tktYuVUqZ+/BLqEDIDhg==}
+  '@openai/codex@0.162.0-alpha.18-linux-arm64':
+    resolution: {integrity: sha512-LH6DfGkNlgZpf7QMgYq4pXgv9yNko9/yht1pkWMgMwcESvz1r4qJjdHsdMOUAwlXaUhZZt9MAKjh6Kl33p2f6w==}
     engines: {node: '>=16'}
     cpu: [arm64]
     os: [linux]
 
-  '@openai/codex@0.162.0-alpha.12-linux-x64':
-    resolution: {integrity: sha512-X1xyqvc/NbPYUars9eNemROhsHdssw7XSu1INDKQIIOxbemsjDxA+vC/P552mLwBfq6NPYQhpAbAnYDCvfH4qw==}
+  '@openai/codex@0.162.0-alpha.18-linux-x64':
+    resolution: {integrity: sha512-DZjytwB+j3PAenrnj3sDGydFDIsTttmXXu9mqF8VNuIv0ZSU01GvkG9x52Oo0GXW8gDCYmoBr8LwC20/ggFdRA==}
     engines: {node: '>=16'}
     cpu: [x64]
     os: [linux]
 
-  '@openai/codex@0.162.0-alpha.12-win32-arm64':
-    resolution: {integrity: sha512-WEXqZ/jCuFD9y5u54mepeFj5ECSndch++4b52ZyvetS9X1FU/VGm3rAjKUKjqoINJ4QRW5IH6082OvpLsr6fyg==}
+  '@openai/codex@0.162.0-alpha.18-win32-arm64':
+    resolution: {integrity: sha512-AFbZIYwCV1t+y8nxtkGTdF+Kj+403Ly6If8P06CBECzRc/FD3DDeYHKyj1YG9irwJ9bl4jC7O4q3B1aymd/uIQ==}
     engines: {node: '>=16'}
     cpu: [arm64]
     os: [win32]
 
-  '@openai/codex@0.162.0-alpha.12-win32-x64':
-    resolution: {integrity: sha512-OklUK5rE1gzaCf1goLSMbB9wHaB1B4nzib4bHc8jBN5WZK6cK4YpDIDf0eine2ngUy0zUtWz3acbK9TUsKAu+Q==}
+  '@openai/codex@0.162.0-alpha.18-win32-x64':
+    resolution: {integrity: sha512-UVa3e3qYUf6UF0vAqbIefnsCw23ZIDotq1rgs4QOFsL1K92i+DdoBdRn7ES++H18LkTLDUaiWf6Pm7MZ5wJPpA==}
     engines: {node: '>=16'}
     cpu: [x64]
     os: [win32]
@@ -542,8 +545,8 @@ packages:
     resolution: {integrity: sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==}
     engines: {node: '>= 0.4'}
 
-  hono@4.13.5:
-    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
+  hono@4.13.10:
+    resolution: {integrity: sha512-dQuLsa5oO+47QVMVMaaD9cIv8ctmVtK1iRvwWngkfloFJMeFeuoUFDswIqZGxmGX3hrRzREgEArjkK9OgsQEhA==}
     engines: {node: '>=16.9.0'}
 
   http-errors@2.0.1:
@@ -642,8 +645,8 @@ packages:
     engines: {node: '>=14'}
     hasBin: true
 
-  proxy-addr@2.0.7:
-    resolution: {integrity: sha512-llQsMLSUDUPT44jdrU/O37qlnifitDP+ZwrmmZcoSKyLKvtZxpyV0n2/bD/N4tBAAZ/gJEdZU7KMraoK1+XYAg==}
+  proxy-addr@2.0.8:
+    resolution: {integrity: sha512-5nnx0yGyVUcY6t9RnWcARWtwT9F1D8O9rt08htPvnd49W1IgZtmLkhu9WfMzQj1cFxjHIO6connUNVW5k7AVyQ==}
     engines: {node: '>= 0.10'}
 
   qs@6.16.0:
@@ -832,13 +835,13 @@ snapshots:
   '@esbuild/win32-x64@0.28.2':
     optional: true
 
-  '@hono/node-server@2.1.1(hono@4.13.5)':
+  '@hono/node-server@2.1.1(hono@4.13.10)':
     dependencies:
-      hono: 4.13.5
+      hono: 4.13.10
 
-  '@modelcontextprotocol/sdk@1.30.1(zod@4.6.5)':
+  '@modelcontextprotocol/sdk@1.31.0(zod@4.6.5)':
     dependencies:
-      '@hono/node-server': 2.1.1(hono@4.13.5)
+      '@hono/node-server': 2.1.1(hono@4.13.10)
       ajv: 8.20.0
       ajv-formats: 3.0.1(ajv@8.20.0)
       content-type: 1.0.5
@@ -848,7 +851,7 @@ snapshots:
       eventsource-parser: 3.1.1
       express: 5.2.1
       express-rate-limit: 8.7.0(express@5.2.1)
-      hono: 4.13.5
+      hono: 4.13.10
       jose: 6.2.11
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
@@ -858,35 +861,35 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@openai/codex-sdk@0.162.0-alpha.12':
+  '@openai/codex-sdk@0.162.0-alpha.18':
     dependencies:
-      '@openai/codex': 0.162.0-alpha.12
+      '@openai/codex': 0.162.0-alpha.18
 
-  '@openai/codex@0.162.0-alpha.12':
+  '@openai/codex@0.162.0-alpha.18':
     optionalDependencies:
-      '@openai/codex-darwin-arm64': '@openai/codex@0.162.0-alpha.12-darwin-arm64'
-      '@openai/codex-darwin-x64': '@openai/codex@0.162.0-alpha.12-darwin-x64'
-      '@openai/codex-linux-arm64': '@openai/codex@0.162.0-alpha.12-linux-arm64'
-      '@openai/codex-linux-x64': '@openai/codex@0.162.0-alpha.12-linux-x64'
-      '@openai/codex-win32-arm64': '@openai/codex@0.162.0-alpha.12-win32-arm64'
-      '@openai/codex-win32-x64': '@openai/codex@0.162.0-alpha.12-win32-x64'
+      '@openai/codex-darwin-arm64': '@openai/codex@0.162.0-alpha.18-darwin-arm64'
+      '@openai/codex-darwin-x64': '@openai/codex@0.162.0-alpha.18-darwin-x64'
+      '@openai/codex-linux-arm64': '@openai/codex@0.162.0-alpha.18-linux-arm64'
+      '@openai/codex-linux-x64': '@openai/codex@0.162.0-alpha.18-linux-x64'
+      '@openai/codex-win32-arm64': '@openai/codex@0.162.0-alpha.18-win32-arm64'
+      '@openai/codex-win32-x64': '@openai/codex@0.162.0-alpha.18-win32-x64'
 
-  '@openai/codex@0.162.0-alpha.12-darwin-arm64':
+  '@openai/codex@0.162.0-alpha.18-darwin-arm64':
     optional: true
 
-  '@openai/codex@0.162.0-alpha.12-darwin-x64':
+  '@openai/codex@0.162.0-alpha.18-darwin-x64':
     optional: true
 
-  '@openai/codex@0.162.0-alpha.12-linux-arm64':
+  '@openai/codex@0.162.0-alpha.18-linux-arm64':
     optional: true
 
-  '@openai/codex@0.162.0-alpha.12-linux-x64':
+  '@openai/codex@0.162.0-alpha.18-linux-x64':
     optional: true
 
-  '@openai/codex@0.162.0-alpha.12-win32-arm64':
+  '@openai/codex@0.162.0-alpha.18-win32-arm64':
     optional: true
 
-  '@openai/codex@0.162.0-alpha.12-win32-x64':
+  '@openai/codex@0.162.0-alpha.18-win32-x64':
     optional: true
 
   '@types/node@26.6.3':
@@ -1108,7 +1111,7 @@ snapshots:
       on-finished: 2.4.1
       once: 1.4.0
       parseurl: 1.3.3
-      proxy-addr: 2.0.7
+      proxy-addr: 2.0.8
       qs: 6.16.0
       range-parser: 1.3.0
       router: 2.2.0
@@ -1167,7 +1170,7 @@ snapshots:
     dependencies:
       function-bind: 1.1.2
 
-  hono@4.13.5: {}
+  hono@4.13.10: {}
 
   http-errors@2.0.1:
     dependencies:
@@ -1237,7 +1240,7 @@ snapshots:
 
   prettier@3.9.9: {}
 
-  proxy-addr@2.0.7:
+  proxy-addr@2.0.8:
     dependencies:
       forwarded: 0.2.0
       ipaddr.js: 1.9.1

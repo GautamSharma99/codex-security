@@ -36,18 +36,13 @@ import { basename } from "node:path";
 
 const args = [basename(process.argv[1]), ...process.argv.slice(2)];
 if (args.join(" ") === "login --with-api-key") {
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
+  const input = await process.stdin.reduce((text, chunk) => text + chunk, "");
   if (input.trim() !== "secret-key") {
     console.error("wrong key");
     process.exitCode = 2;
-  } else {
-    console.log("API key stored");
   }
 } else if (args.join(" ") === "login status") {
   console.log("Logged in using ChatGPT");
-} else if (args.join(" ") === "logout") {
-  console.log("Logged out");
 } else if (args[0] === "login") {
   console.error("Listening on http://localhost:1455.");
   console.error("Listening on http://localhost.:1455.");
@@ -64,8 +59,7 @@ if (args.join(" ") === "login --with-api-key") {
   console.error('Open "\\u001b[32mhttps://127.auth.example.test/device\\u001b[0m"');
   console.error("Enter this one-time code");
   console.error("\\u001b[36m8356-V2EGR\\u001b[0m");
-  process.exit(0);
-} else {
+} else if (args.join(" ") !== "logout") {
   console.error("unexpected args: " + args.join(" "));
   process.exitCode = 3;
 }
@@ -163,9 +157,8 @@ describe("Codex authentication process boundary", () => {
         script,
         `process.stderr.write(${JSON.stringify(`Open ${url}\n${instruction}\n`)}, () => process.exit(0));\n`,
       );
-      const command = nodeCommand().command;
       const handle = new CodexLoginHandle(
-        { command },
+        nodeCommand(),
         [script],
         process.env,
         () => {},
@@ -174,6 +167,35 @@ describe("Codex authentication process boundary", () => {
       await expect(handle.wait()).resolves.toMatchObject({ success: true });
       expect(handle.verificationUrl).toBe(url);
       expect(handle.userCode).toBe("RIGHT-CODE");
+    },
+  );
+
+  test.each([
+    ["HTTP-only output", "", null],
+    [
+      "HTTP followed by HTTPS",
+      "Open https://auth.example.test/device\n",
+      "https://auth.example.test/device",
+    ],
+  ] as const)(
+    "ignores external plaintext HTTP authentication URLs: %s",
+    async (_description, httpsOutput, verificationUrl) => {
+      const root = await temporaryDirectory("codex-security-auth-http-");
+      const script = join(root, "login.mjs");
+      await writeFile(
+        script,
+        `process.stderr.write(${JSON.stringify(`Open http://auth.example.test/device\n${httpsOutput}User code: ABCD-EFGH\n`)}, () => process.exit(0));\n`,
+      );
+      const handle = new CodexLoginHandle(
+        nodeCommand(),
+        [script],
+        process.env,
+        () => {},
+      );
+
+      await expect(handle.wait()).resolves.toMatchObject({ success: true });
+      expect(handle.verificationUrl).toBe(verificationUrl);
+      expect(handle.userCode).toBe("ABCD-EFGH");
     },
   );
 
@@ -344,6 +366,72 @@ setInterval(() => {}, 1000);
     ).resolves.toMatchObject({ success: false });
     expect(observeSucceeded).not.toHaveBeenCalled();
   });
+
+  test.skipIf(process.platform === "win32")(
+    "cancels login after the parent exits while a descendant holds stderr",
+    async () => {
+      const root = await temporaryDirectory("codex-security-auth-exited-");
+      const script = join(root, "login.mjs");
+      const ready = join(root, "ready");
+      const release = join(root, "release");
+      const descendant = `
+import { existsSync, writeFileSync } from "node:fs";
+const [parent, ready, release] = process.argv.slice(1);
+setTimeout(() => process.exit(1), 10_000);
+let announced = false;
+setInterval(() => {
+  if (existsSync(release)) process.exit(0);
+  if (announced) return;
+  try { process.kill(Number(parent), 0); return; }
+  catch (error) { if (error.code !== "ESRCH") process.exit(1); }
+  announced = true;
+  console.error("Open https://auth.example.test/device");
+  console.error("User code: ABCD-EFGH");
+}, 25);
+writeFileSync(ready, "ready");
+`;
+      await writeFile(
+        script,
+        `
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}, String(process.pid), ${JSON.stringify(ready)}, ${JSON.stringify(release)}], {
+  stdio: ["ignore", "ignore", "inherit"], windowsHide: true,
+});
+child.on("error", () => process.exit(1));
+setInterval(() => { if (existsSync(${JSON.stringify(ready)})) process.exit(0); }, 25);
+setTimeout(() => { child.kill(); process.exit(1); }, 10_000);
+`,
+      );
+      let succeeded = false;
+      const handle = new CodexLoginHandle(
+        nodeCommand(),
+        [script],
+        process.env,
+        () => {
+          succeeded = true;
+        },
+      );
+      const deadline = new AbortController();
+      try {
+        await handle.waitForInstructions({ deviceCode: true });
+        handle.cancel();
+        await expect(
+          Promise.race([
+            handle.wait(),
+            delay(5_000, undefined, { signal: deadline.signal }).then(() => {
+              throw new Error("Canceled login waited for inherited stderr.");
+            }),
+          ]),
+        ).resolves.toMatchObject({ success: false, exitCode: 0 });
+        expect(succeeded).toBe(false);
+      } finally {
+        deadline.abort();
+        await writeFile(release, "released");
+        await handle.wait();
+      }
+    },
+  );
 
   test("does not report a canceled interactive login as successful", async () => {
     const root = await temporaryDirectory("codex-security-auth-cancel-");
