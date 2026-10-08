@@ -506,7 +506,6 @@ describe("CLI", () => {
       const root = await realpath(
         await temporaryDirectory("trusted-hook-git-"),
       );
-      const oldPath = process.env["PATH"];
       try {
         const repository = join(root, "repository");
         const selected = join(repository, "component");
@@ -536,11 +535,6 @@ describe("CLI", () => {
           `#!/bin/sh\nprintf called > ${quote(trustedMarker)}\nexec ${quote(git)} "$@"\n`,
           { mode: 0o700 },
         );
-        process.env["PATH"] = [
-          repositoryTools,
-          trustedTools,
-          oldPath ?? "",
-        ].join(delimiter);
         const output = captureCli(main, "stdout");
         expect(
           await output.run(
@@ -549,6 +543,11 @@ describe("CLI", () => {
               currentDirectory: selected,
               environment: {
                 ...process.env,
+                PATH: [
+                  repositoryTools,
+                  trustedTools,
+                  process.env["PATH"] ?? "",
+                ].join(delimiter),
                 GIT_CONFIG_COUNT: "1",
                 GIT_CONFIG_KEY_0: "core.hooksPath",
                 GIT_CONFIG_VALUE_0: hooks,
@@ -567,8 +566,6 @@ describe("CLI", () => {
           "--working-tree",
         );
       } finally {
-        if (oldPath === undefined) delete process.env["PATH"];
-        else process.env["PATH"] = oldPath;
         await rm(root, { recursive: true, force: true });
       }
     },
