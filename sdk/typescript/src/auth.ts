@@ -1,7 +1,77 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { isIP } from "node:net";
-import { PluginBootstrapError } from "./errors.js";
-import type { CodexCommand, ProcessEnvironment } from "./runtime.js";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { parse } from "smol-toml";
+import type { JsonObject } from "./config.js";
+import { CodexSecurityError, PluginBootstrapError } from "./errors.js";
+import {
+  executablePathForSpawn,
+  expandHome,
+  runCodexCommand,
+  type CodexCommand,
+  type ProcessEnvironment,
+} from "./runtime.js";
+
+const LOGIN_CHILD_TERMINATION_GRACE_MS = 1_000;
+
+/** @internal */
+export function environmentEntry(
+  environment: ProcessEnvironment,
+  requested: string,
+): string | undefined {
+  const exact = environment[requested];
+  if (exact !== undefined || process.platform !== "win32") return exact;
+  const upper = requested.toUpperCase();
+  return Object.entries(environment).find(
+    ([name]) => name.toUpperCase() === upper,
+  )?.[1];
+}
+
+/** @internal */
+export function withoutOpenAiApiKeys<Value>(
+  environment: Record<string, Value>,
+): Record<string, Value> {
+  return Object.fromEntries(
+    Object.entries(environment).filter(
+      ([name]) =>
+        !["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()),
+    ),
+  );
+}
+
+/** @internal */
+export function configuredCodexHome(environment: ProcessEnvironment): string {
+  const configured = environmentEntry(environment, "CODEX_HOME");
+  return resolve(
+    expandHome(
+      configured?.trim() ? configured : join(homedir(), ".codex"),
+      environment,
+    ),
+  );
+}
+
+/** @internal */
+export async function readCodexHomeConfig(
+  environment: ProcessEnvironment,
+  signal?: AbortSignal,
+): Promise<JsonObject> {
+  try {
+    return parse(
+      await readFile(join(configuredCodexHome(environment), "config.toml"), {
+        encoding: "utf8",
+        signal,
+      }),
+    ) as JsonObject;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new CodexSecurityError(
+      "Could not read the configured Codex provider.",
+    );
+  }
+}
 
 export interface LoginResult {
   success: boolean;
@@ -18,84 +88,74 @@ export interface AccountStatus {
 export class CodexLoginHandle {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #completion: Promise<LoginResult>;
-  readonly #urlReady: Promise<void>;
-  readonly #deviceReady: Promise<void>;
-  #resolveUrlReady!: () => void;
-  #rejectUrlReady!: (error: unknown) => void;
-  #resolveDeviceReady!: () => void;
-  #rejectDeviceReady!: (error: unknown) => void;
-  #urlReadySettled = false;
-  #deviceReadySettled = false;
+  readonly #urlReady = Promise.withResolvers<void>();
+  readonly #deviceReady = Promise.withResolvers<void>();
   #canceled = false;
-  #stdout = "";
-  #stderr = "";
+  #forcedTermination: ReturnType<typeof setTimeout> | undefined;
+  readonly #output = { stdout: "", stderr: "" };
+  readonly #tails = { stdout: "", stderr: "" };
+  readonly #urls: Record<"stdout" | "stderr", string | null> = {
+    stdout: null,
+    stderr: null,
+  };
+  readonly #codes: Record<"stdout" | "stderr", string | null> = {
+    stdout: null,
+    stderr: null,
+  };
 
   public constructor(
     command: CodexCommand,
     args: readonly string[],
     environment: ProcessEnvironment,
-    onSuccess: () => void,
+    onSuccess: () => void | Promise<void>,
   ) {
-    this.#urlReady = new Promise<void>((resolve, reject) => {
-      this.#resolveUrlReady = resolve;
-      this.#rejectUrlReady = reject;
-    });
-    this.#deviceReady = new Promise<void>((resolve, reject) => {
-      this.#resolveDeviceReady = resolve;
-      this.#rejectDeviceReady = reject;
-    });
-    void this.#urlReady.catch(() => undefined);
-    void this.#deviceReady.catch(() => undefined);
-    this.#child = spawn(command.command, [...command.prefixArgs, ...args], {
-      env: environment,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    void this.#urlReady.promise.catch(() => undefined);
+    void this.#deviceReady.promise.catch(() => undefined);
+    this.#child = spawn(
+      executablePathForSpawn(command.command),
+      [...(command.args ?? []), ...args],
+      {
+        env: environment,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
     this.#child.stdin.end();
     this.#child.stdout.setEncoding("utf8");
     this.#child.stderr.setEncoding("utf8");
     this.#child.stdout.on("data", (chunk: string) => {
-      this.#stdout += chunk;
-      this.#notifyInstructions();
+      this.#recordOutput("stdout", chunk);
     });
     this.#child.stderr.on("data", (chunk: string) => {
-      this.#stderr += chunk;
-      this.#notifyInstructions();
+      this.#recordOutput("stderr", chunk);
     });
     this.#completion = new Promise((resolve, reject) => {
-      this.#child.once("error", (error) => {
-        this.#settleInstructionWaiters({
-          success: false,
-          exitCode: null,
-          stdout: this.#stdout,
-          stderr: error.message,
-        });
-        reject(error);
-      });
-      let fallback: ReturnType<typeof setTimeout> | undefined;
-      let completed = false;
-      const complete = (exitCode: number | null): void => {
-        if (completed) return;
-        completed = true;
-        if (fallback !== undefined) clearTimeout(fallback);
+      this.#child.once("close", (exitCode) => {
+        clearTimeout(this.#forcedTermination);
+        if (!this.#canceled) {
+          this.#flushInstructionTails();
+        }
         const result = {
           success: exitCode === 0 && !this.#canceled,
           exitCode,
-          stdout: this.#stdout,
-          stderr: this.#stderr,
+          ...this.#output,
         };
         this.#settleInstructionWaiters(result);
-        if (result.success) onSuccess();
-        resolve(result);
-      };
-      this.#child.once("close", complete);
-      this.#child.once("exit", (exitCode) => {
-        if (process.platform !== "win32") return;
-        fallback = setTimeout(() => {
-          this.#child.stdout.destroy();
-          this.#child.stderr.destroy();
-          complete(exitCode);
-        }, 1_000);
+        if (result.success) {
+          Promise.resolve(onSuccess()).then(() => resolve(result), reject);
+        } else {
+          resolve(result);
+        }
+      });
+      this.#child.once("error", (error) => {
+        clearTimeout(this.#forcedTermination);
+        this.#settleInstructionWaiters({
+          success: false,
+          exitCode: null,
+          stdout: this.#output.stdout,
+          stderr: error.message,
+        });
+        reject(error);
       });
     });
   }
@@ -105,7 +165,7 @@ export class CodexLoginHandle {
   }
 
   public get authUrl(): string | null {
-    return preferredAuthUrl(`${this.#stdout}\n${this.#stderr}`);
+    return this.#urls.stdout ?? this.#urls.stderr;
   }
 
   public get verificationUrl(): string | null {
@@ -113,12 +173,7 @@ export class CodexLoginHandle {
   }
 
   public get userCode(): string | null {
-    const output = plainTerminalText(`${this.#stdout}\n${this.#stderr}`);
-    return (
-      output.match(/(?:code|user code)\s*[:=]\s*([A-Z0-9-]{4,})/i)?.[1] ??
-      output.match(/\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b/)?.[0] ??
-      null
-    );
+    return this.#codes.stdout ?? this.#codes.stderr;
   }
 
   public async wait(): Promise<LoginResult> {
@@ -128,42 +183,63 @@ export class CodexLoginHandle {
   public async waitForInstructions(
     options: { deviceCode?: boolean } = {},
   ): Promise<void> {
-    await (options.deviceCode === true ? this.#deviceReady : this.#urlReady);
+    await (options.deviceCode === true ? this.#deviceReady : this.#urlReady)
+      .promise;
   }
 
   public cancel(): void {
-    if (this.#child.exitCode === null) {
-      this.#canceled = true;
-      this.#child.kill("SIGTERM");
+    this.#canceled = true;
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      // Descendants can retain inherited pipes after the login process exits.
+      // Cancellation must release those pipes so the close event can settle.
+      this.#child.stdin.destroy();
+      this.#child.stdout.destroy();
+      this.#child.stderr.destroy();
+      return;
+    }
+    this.#child.kill("SIGTERM");
+    if (this.#forcedTermination !== undefined) return;
+    this.#forcedTermination = setTimeout(() => {
+      if (this.#child.exitCode === null && this.#child.signalCode === null) {
+        this.#child.kill("SIGKILL");
+      }
+      this.#child.stdin.destroy();
+      this.#child.stdout.destroy();
+      this.#child.stderr.destroy();
+    }, LOGIN_CHILD_TERMINATION_GRACE_MS);
+  }
+
+  #recordOutput(stream: "stdout" | "stderr", chunk: string): void {
+    this.#output[stream] += chunk;
+    const output = `${this.#tails[stream]}${chunk.replaceAll("\r", "\n")}`;
+    const lastDelimiter = output.lastIndexOf("\n");
+    const completed =
+      lastDelimiter === -1 ? "" : output.slice(0, lastDelimiter + 1);
+    this.#urls[stream] ??= preferredAuthUrl(completed);
+    this.#codes[stream] ??= userCodeFromOutput(completed);
+    this.#tails[stream] =
+      lastDelimiter === -1 ? output : output.slice(lastDelimiter + 1);
+    this.#notifyInstructions();
+  }
+
+  #flushInstructionTails(): void {
+    for (const stream of ["stdout", "stderr"] as const) {
+      this.#urls[stream] ??= preferredAuthUrl(this.#tails[stream]);
+      this.#codes[stream] ??= userCodeFromOutput(this.#tails[stream]);
     }
   }
 
   #notifyInstructions(): void {
-    if (!this.#urlReadySettled && this.authUrl !== null) {
-      this.#urlReadySettled = true;
-      this.#resolveUrlReady();
-    }
-    if (
-      !this.#deviceReadySettled &&
-      this.verificationUrl !== null &&
-      this.userCode !== null
-    ) {
-      this.#deviceReadySettled = true;
-      this.#resolveDeviceReady();
-    }
+    if (this.authUrl !== null) this.#urlReady.resolve();
+    if (this.verificationUrl !== null && this.userCode !== null)
+      this.#deviceReady.resolve();
   }
 
   #settleInstructionWaiters(result: LoginResult): void {
     this.#notifyInstructions();
     if (result.success) {
-      if (!this.#urlReadySettled) {
-        this.#urlReadySettled = true;
-        this.#resolveUrlReady();
-      }
-      if (!this.#deviceReadySettled) {
-        this.#deviceReadySettled = true;
-        this.#resolveDeviceReady();
-      }
+      this.#urlReady.resolve();
+      this.#deviceReady.resolve();
       return;
     }
     const error = new PluginBootstrapError(
@@ -171,14 +247,8 @@ export class CodexLoginHandle {
         ? "Codex login was canceled."
         : `Codex login exited before authentication instructions were available: ${result.stderr.trim() || result.stdout.trim() || result.exitCode || "unknown error"}`,
     );
-    if (!this.#urlReadySettled) {
-      this.#urlReadySettled = true;
-      this.#rejectUrlReady(error);
-    }
-    if (!this.#deviceReadySettled) {
-      this.#deviceReadySettled = true;
-      this.#rejectDeviceReady(error);
-    }
+    this.#urlReady.reject(error);
+    this.#deviceReady.reject(error);
   }
 }
 
@@ -191,7 +261,7 @@ export async function loginApiKey(
   if (apiKey.trim().length === 0) {
     throw new PluginBootstrapError("The API key must be non-empty.");
   }
-  return await runCodex(
+  return await runCodexCommand(
     command,
     ["login", "--with-api-key"],
     environment,
@@ -205,7 +275,7 @@ export async function accountStatus(
   environment: ProcessEnvironment,
   signal?: AbortSignal,
 ): Promise<AccountStatus> {
-  const result = await runCodex(
+  const result = await runCodexCommand(
     command,
     ["login", "status"],
     environment,
@@ -227,7 +297,7 @@ export async function logout(
   environment: ProcessEnvironment,
   signal?: AbortSignal,
 ): Promise<void> {
-  const result = await runCodex(
+  const result = await runCodexCommand(
     command,
     ["logout"],
     environment,
@@ -241,82 +311,55 @@ export async function logout(
   }
 }
 
-export async function runCodex(
-  command: CodexCommand,
-  args: readonly string[],
-  environment: ProcessEnvironment,
-  input?: string,
-  signal?: AbortSignal,
-): Promise<LoginResult> {
-  const child = spawn(command.command, [...command.prefixArgs, ...args], {
-    env: environment,
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-    signal,
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-  const completion = new Promise<LoginResult>((resolve, reject) => {
-    let processError: Error | null = null;
-    child.once("error", (error) => {
-      processError = error;
-    });
-    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-      // A short-lived command can close stdin before Node flushes the input.
-      // Its exit status remains authoritative; the stream error must not escape
-      // as an uncaught exception.
-      if (
-        error.code !== "EPIPE" &&
-        error.code !== "ECONNRESET" &&
-        error.code !== "EOF" &&
-        error.code !== "ERR_STREAM_DESTROYED"
-      ) {
-        processError ??= error;
-      }
-    });
-    child.once("close", (exitCode) => {
-      if (processError !== null) {
-        reject(processError);
-      } else {
-        resolve({ success: exitCode === 0, exitCode, stdout, stderr });
-      }
-    });
-  });
-  child.stdin.end(input);
-  return await completion;
-}
+/** @internal Authentication settings shared by login and model commands. */
+export const CODEX_AUTH_CONFIG_KEYS = [
+  "cli_auth_credentials_store",
+  "forced_login_method",
+  "forced_chatgpt_workspace_id",
+] as const;
+
+/** @internal Shared login recovery guidance for model commands. */
+export const NO_CREDENTIALS_MESSAGE =
+  "No credentials were found. Run 'codex-security login'. On a remote or headless " +
+  "machine, use 'codex-security login --device-auth' if your workspace allows it. " +
+  "If device auth is disabled, see 'codex-security login --help' for browser login over SSH. " +
+  "For CI, set OPENAI_API_KEY or CODEX_API_KEY.";
 
 function preferredAuthUrl(value: string): string | null {
-  const urls = [
-    ...plainTerminalText(value).matchAll(/https?:\/\/[^\s<>]+/g),
-  ].map((match) => match[0].replace(/[.,;:!?)\]}]+$/, ""));
-  return (
-    urls.find((url) => {
-      try {
-        const hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
-        return (
-          hostname !== "localhost" &&
-          !hostname.endsWith(".localhost") &&
-          !(isIP(hostname) === 4 && hostname.startsWith("127.")) &&
-          hostname !== "0.0.0.0" &&
-          hostname !== "[::1]" &&
-          hostname !== "[::]" &&
-          hostname !== "[::ffff:0:0]" &&
-          !hostname.startsWith("[::ffff:7f") &&
-          !hostname.startsWith("[::7f")
-        );
-      } catch {
-        return false;
+  for (const match of plainTerminalText(value).matchAll(
+    /https?:\/\/[^\s<>"']+/g,
+  )) {
+    const url = match[0].replace(/[.,;:!?)\]}]+$/, "");
+    try {
+      const parsed = new URL(url);
+      const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      if (
+        parsed.protocol === "https:" &&
+        hostname !== "localhost" &&
+        !hostname.endsWith(".localhost") &&
+        !(isIP(hostname) === 4 && hostname.startsWith("127.")) &&
+        hostname !== "0.0.0.0" &&
+        hostname !== "[::1]" &&
+        hostname !== "[::]" &&
+        hostname !== "[::ffff:0:0]" &&
+        !hostname.startsWith("[::ffff:7f") &&
+        !hostname.startsWith("[::7f")
+      ) {
+        return url;
       }
-    }) ?? null
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function userCodeFromOutput(value: string): string | null {
+  const output = plainTerminalText(value).replace(/https?:\/\/[^\s<>"']+/g, "");
+  return (
+    output.match(/(?:code|user code)\s*[:=]\s*([A-Z0-9-]{4,})/i)?.[1] ??
+    output.match(/\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b/)?.[0] ??
+    null
   );
 }
 
