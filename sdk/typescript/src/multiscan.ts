@@ -333,23 +333,26 @@ async function runCampaign(
       task.id,
       `attempt-${receipt.attempt}`,
     );
+    const selectedOutputMatches =
+      receipt.outputDir === artifactOutput ||
+      receipt.outputDir === selectedArtifactOutput;
+    const artifactsPresent =
+      selectedOutputMatches && (await hasArtifacts(artifactOutput));
     if (
-      (receipt.outputDir === artifactOutput ||
-        receipt.outputDir === selectedArtifactOutput) &&
-      (await hasArtifacts(artifactOutput))
-    ) {
-      if (
-        receipt.status === "completed" &&
+      receipt.status === "completed" &&
+      selectedOutputMatches &&
+      (!artifactsPresent ||
         !(await hasCompleteContract(
           artifactOutput,
           await resumePluginRoot(),
           options.signal,
-        ))
-      ) {
-        rejectedCompleted.add(artifactOutput);
-        pending.push(task);
-        continue;
-      }
+        )))
+    ) {
+      rejectedCompleted.add(artifactOutput);
+      pending.push(task);
+      continue;
+    }
+    if (artifactsPresent) {
       if (receipt.status !== "failed" && receipt.warnings?.length) {
         warnings.push({ repository: task.id, warnings: receipt.warnings });
         for (const warning of receipt.warnings) {

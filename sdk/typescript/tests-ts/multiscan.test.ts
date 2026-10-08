@@ -2343,6 +2343,7 @@ describe("multiscan", () => {
   );
 
   test.each([
+    ["missing", false],
     ["unsealed", false],
     ["partial", false],
     ["unsealed", true],
@@ -2356,7 +2357,8 @@ describe("multiscan", () => {
       const [receipt] = await results(join(paths.output, "results.jsonl"));
       const scanDir = receipt!["outputDir"] as string;
       const coveragePath = join(scanDir, "coverage.json");
-      if (integrity === "unsealed") await appendFile(coveragePath, "\n");
+      if (integrity === "missing") await rm(join(scanDir, "findings.json"));
+      else if (integrity === "unsealed") await appendFile(coveragePath, "\n");
       else await completedScan(scanDir, "partial");
       const before = await readFile(coveragePath, "utf8");
       const checkout = join(paths.output, "checkouts", "invalid-recovery");
@@ -2383,6 +2385,12 @@ describe("multiscan", () => {
         );
       expect(run).toHaveBeenCalledTimes(newerAttempt ? 1 : 2);
       expect(await readFile(coveragePath, "utf8")).toBe(before);
+      if (integrity === "missing")
+        await expect(
+          lstat(join(scanDir, "findings.json")),
+        ).rejects.toMatchObject({
+          code: "ENOENT",
+        });
       expect(await readFile(join(checkout, "retained.txt"), "utf8")).toBe(
         "Original checkout.",
       );
