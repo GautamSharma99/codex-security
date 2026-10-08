@@ -22,7 +22,7 @@ import { promisify } from "node:util";
 import Papa from "papaparse";
 import type { CodexSecurity } from "./api.js";
 import type { CodexSecurityConfig } from "./config.js";
-import { loadContract } from "./contract.js";
+import { ContractSchemaError, loadContract } from "./contract.js";
 import type { ScanCost } from "./cost.js";
 import { readThreatModelPath } from "./artifact-export.js";
 import {
@@ -292,6 +292,7 @@ async function runCampaign(
     options.recoverScan !== undefined,
   );
   const pending: MultiscanTask[] = [];
+  const rejectedCompleted = new Set<string>();
   let completed = 0;
   let incomplete = 0;
   let policyFailed = false;
@@ -335,14 +336,20 @@ async function runCampaign(
     if (
       (receipt.outputDir === artifactOutput ||
         receipt.outputDir === selectedArtifactOutput) &&
-      (await hasArtifacts(artifactOutput)) &&
-      (receipt.status !== "completed" ||
-        (await hasCompleteContract(
+      (await hasArtifacts(artifactOutput))
+    ) {
+      if (
+        receipt.status === "completed" &&
+        !(await hasCompleteContract(
           artifactOutput,
           await resumePluginRoot(),
           options.signal,
-        )))
-    ) {
+        ))
+      ) {
+        rejectedCompleted.add(artifactOutput);
+        pending.push(task);
+        continue;
+      }
       if (receipt.status !== "failed" && receipt.warnings?.length) {
         warnings.push({ repository: task.id, warnings: receipt.warnings });
         for (const warning of receipt.warnings) {
@@ -445,7 +452,12 @@ async function runCampaign(
             | (Pick<ScanResult, "coverage" | "cost" | "findings"> &
                 Partial<Pick<ScanResult, "threatModelPath">>)
             | undefined;
-          if (options.recoverScan !== undefined && retry === 0 && attempt > 0) {
+          if (
+            options.recoverScan !== undefined &&
+            retry === 0 &&
+            attempt > 0 &&
+            !rejectedCompleted.has(scanDir)
+          ) {
             const existing = await lstat(scanDir).catch(undefinedIfMissingFile);
             if (existing !== undefined) {
               await ensureOutputDirectory(scanDir);
@@ -1098,8 +1110,9 @@ async function hasCompleteContract(
     signal?.throwIfAborted();
     const contract = await loadContract(path, { pluginRoot, signal });
     return contract.coverage.completeness === "complete";
-  } catch {
+  } catch (error) {
     signal?.throwIfAborted();
+    if (error instanceof ContractSchemaError) throw error;
     return false;
   }
 }

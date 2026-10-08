@@ -11,7 +11,11 @@ import {
 import { isAbsolute, join, posix, resolve } from "node:path";
 import Ajv2020, { type ErrorObject } from "ajv/dist/2020.js";
 import { regexes } from "zod";
-import { ContractValidationError, abortReason } from "./errors.js";
+import {
+  ContractValidationError,
+  abortReason,
+  errorMessage,
+} from "./errors.js";
 import { isRecord } from "./record.js";
 import type {
   ContractObject as JsonRecord,
@@ -69,6 +73,8 @@ export interface LoadedContract {
   coverage: CoverageDocument;
 }
 
+export class ContractSchemaError extends ContractValidationError {}
+
 type LoadContractOptions = {
   pluginRoot: string;
   expectedScanId?: string;
@@ -122,7 +128,10 @@ export async function loadContractWithScanDirectory(
     const schema = await readJson(
       join(options.pluginRoot, "schemas", schemaName),
       options.signal,
-    );
+    ).catch((error: unknown) => {
+      throwIfAborted(options.signal);
+      throw new ContractSchemaError(errorMessage(error), { cause: error });
+    });
     let validate: ReturnType<typeof ajv.compile>;
     let payload: unknown;
     let valid: boolean;
@@ -145,7 +154,7 @@ export async function loadContractWithScanDirectory(
         valid = validatePayload(payload);
       }
     } catch {
-      throw new ContractValidationError(`${schemaName}: invalid JSON Schema.`);
+      throw new ContractSchemaError(`${schemaName}: invalid JSON Schema.`);
     }
     if (!valid) {
       throw schemaError(filename, validate.errors ?? []);
